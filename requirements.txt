@@ -1,0 +1,12 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+aiohttp>=3.9.0
+loguru>=0.7.0
+pytz>=2023.3
+python-dotenv>=1.0.0
+websockets>=12.0
+httpx>=0.25.0
+openai>=1.0.0
+deepgram-sdk>=3.0.0
+pipecat-ai[openai,deepgram,cartesia,silero]>=0.0.30
+twilio>=8.0.0

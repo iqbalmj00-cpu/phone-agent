@@ -57,7 +57,6 @@ from config import (
 )
 from agent.prompt import build_system_prompt
 from agent.handlers import (
-    handle_check_availability,
     handle_create_booking,
     handle_lookup_appointment,
     handle_reschedule_appointment,
@@ -72,24 +71,8 @@ from agent.context import should_compress, compress_context
 
 tools = ToolsSchema(standard_tools=[
     FunctionSchema(
-        name="check_availability",
-        description="Check available appointment slots. Only during business hours on business days.",
-        properties={
-            "date": {
-                "type": "string",
-                "description": "YYYY-MM-DD (resolve relative dates first)",
-            },
-            "time_preference": {
-                "type": "string",
-                "enum": ["morning", "afternoon", "any"],
-                "description": "Preferred time of day",
-            },
-        },
-        required=["date"],
-    ),
-    FunctionSchema(
         name="create_booking",
-        description="Book an appointment. ONLY call this after reading back all details and receiving verbal confirmation from the caller.",
+        description="Book a junk removal pickup. ONLY call this after reading back all details and receiving verbal confirmation from the caller.",
         properties={
             "name": {"type": "string", "description": "Customer full name"},
             "phone": {"type": "string", "description": "Customer phone number"},
@@ -97,13 +80,8 @@ tools = ToolsSchema(standard_tools=[
             "date": {"type": "string", "description": "YYYY-MM-DD"},
             "time": {"type": "string", "description": "HH:MM (24-hour)"},
             "description": {"type": "string", "description": "Items for removal"},
-            "type": {
-                "type": "string",
-                "enum": ["pickup", "in_person_estimate"],
-                "description": "Type of appointment",
-            },
         },
-        required=["name", "phone", "address", "date", "time", "description", "type"],
+        required=["name", "phone", "address", "date", "time", "description"],
     ),
     FunctionSchema(
         name="lookup_appointment",
@@ -224,7 +202,6 @@ async def run_bot(
 
     # ── Register Tool Handlers ──────────────────────────
 
-    llm.register_function("check_availability", handle_check_availability)
     llm.register_function(
         "create_booking", handle_create_booking, cancel_on_interruption=False
     )

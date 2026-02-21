@@ -176,7 +176,6 @@ async def handle_create_booking(params: FunctionCallParams):
     date = params.arguments["date"]
     time = params.arguments["time"]
     description = params.arguments["description"]
-    appt_type = params.arguments.get("type", "pickup")
 
     # ── Validate date ──
     parsed_date = _validate_date(date)
@@ -211,7 +210,7 @@ async def handle_create_booking(params: FunctionCallParams):
                     "customerPhone": phone,
                     "address": address,
                     "date": f"{date}T{time}:00",
-                    "notes": f"{appt_type.replace('_', ' ').title()}: {description}",
+                    "notes": f"Junk Removal Pickup: {description}",
                 },
                 headers=_agent_headers(config),
                 timeout=aiohttp.ClientTimeout(total=15),

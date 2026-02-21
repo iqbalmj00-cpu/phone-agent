@@ -63,6 +63,7 @@ from agent.handlers import (
     handle_reschedule_appointment,
     handle_cancel_appointment,
     set_call_context,
+    clear_call_context,
 )
 from agent.context import should_compress, compress_context
 
@@ -277,6 +278,9 @@ async def run_bot(
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(transport, client):
         logger.info(f"Call disconnected: {call_id}")
+
+        # Clean up per-call context
+        clear_call_context(call_id)
 
         # Generate post-call summary
         call_end_time = datetime.now(ZoneInfo(timezone))

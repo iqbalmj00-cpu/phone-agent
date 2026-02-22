@@ -82,7 +82,7 @@ def build_system_prompt(config: dict[str, Any]) -> str:
         "garage cleanouts", "estate cleanouts"
     ])
 
-    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
     active_days = [day_names[d] for d in business_days if 0 <= d <= 6]
     days_str = f"{active_days[0]} through {active_days[-1]}" if len(active_days) > 1 else active_days[0] if active_days else "Monday through Saturday"
 

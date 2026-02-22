@@ -63,6 +63,7 @@ from agent.handlers import (
     handle_cancel_appointment,
     set_call_context,
     clear_call_context,
+    is_booking_complete,
 )
 from agent.context import should_compress, compress_context
 
@@ -131,6 +132,7 @@ async def run_bot(
     # ── Tracking ────────────────────────────────────────
     call_start_time = datetime.now(ZoneInfo(timezone))
     tool_calls_made = []
+    last_caller_speech_time = datetime.now(ZoneInfo(timezone))
 
     # ── Greeting ────────────────────────────────────────
     greeting = f"Thanks for calling {company_name}, this is {agent_name}, how can I help you?"
@@ -249,8 +251,9 @@ async def run_bot(
         # Play greeting immediately via TTS frame
         await task.queue_frames([TTSSpeakFrame(text=greeting)])
 
-        # Start call duration timer
+        # Start call duration timer and post-booking silence watcher
         asyncio.create_task(_call_timeout_watcher(task, context))
+        asyncio.create_task(_post_booking_watcher(task, context, call_id))
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(transport, client):
@@ -283,6 +286,52 @@ async def run_bot(
 
         logger.info(f"Call summary [{call_id}] ({duration_s}s): {summary}")
         await task.cancel()
+
+    # ── Track caller speech for post-booking silence timer ──
+
+    @stt.event_handler("on_transcript")
+    async def on_transcript(stt_service, transcript):
+        nonlocal last_caller_speech_time
+        last_caller_speech_time = datetime.now(ZoneInfo(timezone))
+
+    # ── Post-Booking Silence Watcher ───────────────────
+
+    async def _post_booking_watcher(task, context, cid: str):
+        """After a booking completes, hang up if caller is silent for 60 seconds."""
+        POST_BOOKING_SILENCE_SECONDS = 60
+
+        try:
+            # Phase 1: Wait for booking to complete
+            while not is_booking_complete(cid):
+                await asyncio.sleep(2)
+
+            logger.info(f"Booking complete for {cid} — starting silence watchdog")
+
+            # Phase 2: Monitor silence — reset timer on any caller speech
+            while True:
+                now = datetime.now(ZoneInfo(timezone))
+                elapsed = (now - last_caller_speech_time).total_seconds()
+
+                if elapsed >= POST_BOOKING_SILENCE_SECONDS:
+                    logger.info(f"Post-booking silence ({POST_BOOKING_SILENCE_SECONDS}s) — ending call {cid}")
+
+                    # Inject goodbye message for the LLM to speak
+                    context.messages.append({
+                        "role": "system",
+                        "content": "The caller has been silent for a while after the booking was confirmed. Say a brief, warm goodbye like: 'Alright, it sounds like we're all set! We'll see you on your scheduled day. Have a great one!' Then stop talking.",
+                    })
+                    await task.queue_frames([LLMMessagesFrame(context.messages)])
+
+                    # Wait for TTS to finish the goodbye
+                    await asyncio.sleep(8)
+                    await task.cancel()
+                    return
+
+                # Check every 5 seconds
+                await asyncio.sleep(5)
+
+        except asyncio.CancelledError:
+            pass  # Call ended before silence timer fired
 
     # ── Call Timer ──────────────────────────────────────
 

@@ -41,6 +41,18 @@ def clear_call_context(call_sid: str):
     _call_contexts.pop(call_sid, None)
 
 
+def mark_booking_complete(call_sid: str):
+    """Flag that a booking was successfully created for this call."""
+    if call_sid in _call_contexts:
+        _call_contexts[call_sid]["booking_complete"] = True
+
+
+def is_booking_complete(call_sid: str) -> bool:
+    """Check if a booking has been completed during this call."""
+    ctx = _call_contexts.get(call_sid, {})
+    return ctx.get("booking_complete", False)
+
+
 def _get_context() -> dict[str, Any]:
     """Get the most recent call context.
 
@@ -223,6 +235,11 @@ async def handle_create_booking(params: FunctionCallParams):
                 data = await resp.json()
                 job_id = data.get("jobId", "confirmed")
                 logger.info(f"Booking created: jobId={job_id} for {name} on {date} at {time}")
+
+                # Signal bot.py to start post-booking silence timer
+                ctx = _get_context()
+                if ctx.get("call_sid"):
+                    mark_booking_complete(ctx["call_sid"])
 
                 await params.result_callback({
                     "success": True,

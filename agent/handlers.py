@@ -93,7 +93,9 @@ def _is_business_hours(date: datetime, hour: int, config: dict) -> bool:
     business_start = config.get("businessStart", 7)
     business_end = config.get("businessEnd", 19)
 
-    if date.weekday() not in business_days:
+    # Convert Python weekday (0=Mon) to JS convention (0=Sun) used by dashboard
+    js_day = (date.weekday() + 1) % 7
+    if js_day not in business_days:
         return False
     if hour < business_start or hour >= business_end:
         return False
@@ -119,7 +121,8 @@ async def handle_check_availability(params: FunctionCallParams):
         return
 
     business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
-    if parsed_date.weekday() not in business_days:
+    js_day = (parsed_date.weekday() + 1) % 7
+    if js_day not in business_days:
         await params.result_callback({
             "available": False,
             "message": "That day we're closed. Let me find a day that works.",

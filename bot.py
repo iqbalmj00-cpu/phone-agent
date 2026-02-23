@@ -297,17 +297,30 @@ async def run_bot(
     # ── Post-Booking Silence Watcher ───────────────────
 
     async def _post_booking_watcher(task, context, cid: str):
-        """After a booking completes, hang up if caller is silent for 60 seconds."""
-        POST_BOOKING_SILENCE_SECONDS = 60
+        """After a booking completes, prompt the agent to ask if they need
+        anything else and only hang up after extended silence (safety net)."""
+        POST_BOOKING_SILENCE_SECONDS = 90  # safety net — longer timeout
 
         try:
             # Phase 1: Wait for booking to complete
             while not is_booking_complete(cid):
                 await asyncio.sleep(2)
 
-            logger.info(f"Booking complete for {cid} — starting silence watchdog")
+            logger.info(f"Booking complete for {cid} — prompting agent to ask if customer needs anything else")
 
-            # Phase 2: Monitor silence — reset timer on any caller speech
+            # Nudge the LLM to ask if the customer needs anything else
+            context.messages.append({
+                "role": "system",
+                "content": (
+                    "The booking was just confirmed. Now ask the customer: "
+                    "'Is there anything else I can help you with today?' "
+                    "Wait for their response. If they have more questions, help them. "
+                    "Only say goodbye after they confirm they're all set."
+                ),
+            })
+            await task.queue_frames([LLMMessagesFrame(context.messages)])
+
+            # Phase 2: Safety net — if caller goes completely silent for 90s, wrap up
             while True:
                 now = datetime.now(ZoneInfo(timezone))
                 elapsed = (now - last_caller_speech_time).total_seconds()
@@ -315,19 +328,16 @@ async def run_bot(
                 if elapsed >= POST_BOOKING_SILENCE_SECONDS:
                     logger.info(f"Post-booking silence ({POST_BOOKING_SILENCE_SECONDS}s) — ending call {cid}")
 
-                    # Inject goodbye message for the LLM to speak
                     context.messages.append({
                         "role": "system",
-                        "content": "The caller has been silent for a while after the booking was confirmed. Say a brief, warm goodbye like: 'Alright, it sounds like we're all set! We'll see you on your scheduled day. Have a great one!' Then stop talking.",
+                        "content": "The caller has been silent for a while. Say a brief, warm goodbye like: 'Alright, sounds like we're all set! We'll see you on your scheduled day. Have a great one!' Then stop talking.",
                     })
                     await task.queue_frames([LLMMessagesFrame(context.messages)])
 
-                    # Wait for TTS to finish the goodbye
                     await asyncio.sleep(8)
                     await task.cancel()
                     return
 
-                # Check every 5 seconds
                 await asyncio.sleep(5)
 
         except asyncio.CancelledError:

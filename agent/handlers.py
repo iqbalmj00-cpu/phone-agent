@@ -215,6 +215,10 @@ async def handle_create_booking(params: FunctionCallParams):
 
     # ── Create booking via /api/agent/book ──
     company_name = config.get("companyName", "the company")
+    tz = config.get("timezone", "America/Chicago")
+    tz_offset = datetime.now(ZoneInfo(tz)).strftime("%z")
+    # Format offset as -06:00 (insert colon)
+    tz_offset_formatted = f"{tz_offset[:3]}:{tz_offset[3:]}" if len(tz_offset) == 5 else tz_offset
 
     try:
         async with aiohttp.ClientSession() as http:
@@ -224,7 +228,7 @@ async def handle_create_booking(params: FunctionCallParams):
                     "customerName": name,
                     "customerPhone": phone,
                     "address": address,
-                    "date": f"{date}T{time}:00",
+                    "date": f"{date}T{time}:00{tz_offset_formatted}",
                     "notes": f"Junk Removal Pickup: {description}",
                 },
                 headers=_agent_headers(config),

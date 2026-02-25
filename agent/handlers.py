@@ -79,6 +79,16 @@ def _agent_headers(config: dict[str, Any]) -> dict[str, str]:
     }
 
 
+# ── Time Slots (must match website wizardData.ts) ───────
+
+TIME_SLOTS = {
+    "morning":   {"label": "Morning",        "start": "08:00", "end": "10:00", "start_hour": 8,  "period": "Morning"},
+    "midday":    {"label": "Midday",          "start": "10:00", "end": "12:00", "start_hour": 10, "period": "Midday"},
+    "afternoon": {"label": "Afternoon",       "start": "12:00", "end": "14:00", "start_hour": 12, "period": "Afternoon"},
+    "late":      {"label": "Late Afternoon",  "start": "14:00", "end": "16:00", "start_hour": 14, "period": "Late Afternoon"},
+}
+
+
 # ── Date / Time Validation ──────────────────────────────
 
 def _validate_date(date_str: str) -> datetime | None:
@@ -88,15 +98,9 @@ def _validate_date(date_str: str) -> datetime | None:
         return None
 
 
-def _validate_time(time_str: str) -> tuple[int, int] | None:
-    try:
-        parts = time_str.split(":")
-        h, m = int(parts[0]), int(parts[1])
-        if 0 <= h <= 23 and 0 <= m <= 59:
-            return (h, m)
-    except (ValueError, IndexError):
-        pass
-    return None
+def _validate_time_slot(slot_id: str) -> dict | None:
+    """Validate a time slot ID and return the slot definition, or None."""
+    return TIME_SLOTS.get(slot_id.lower().strip()) if slot_id else None
 
 
 def _is_business_hours(date: datetime, hour: int, config: dict) -> bool:
@@ -180,7 +184,7 @@ async def handle_check_availability(params: FunctionCallParams):
 async def handle_create_booking(params: FunctionCallParams):
     """Create a booking via dashboard's /api/agent/book.
 
-    Dashboard expects: { customerName, customerPhone, address, volume, date, notes }
+    Dashboard expects: { customerName, customerPhone, address, volume, date, timeSlot, notes }
     Dashboard returns: { success, jobId, customerId, message } (status 201)
     Auth: X-AGENT-SECRET header (siteToken)
     """
@@ -189,7 +193,7 @@ async def handle_create_booking(params: FunctionCallParams):
     phone = params.arguments["phone"]
     address = params.arguments["address"]
     date = params.arguments["date"]
-    time = params.arguments["time"]
+    time_slot_id = params.arguments["time"]
     description = params.arguments["description"]
 
     # ── Validate date ──
@@ -198,14 +202,16 @@ async def handle_create_booking(params: FunctionCallParams):
         await params.result_callback({"error": "Date must be YYYY-MM-DD format."})
         return
 
-    # ── Validate time ──
-    parsed_time = _validate_time(time)
-    if not parsed_time:
-        await params.result_callback({"error": "Time must be HH:MM format."})
+    # ── Validate time slot ──
+    slot = _validate_time_slot(time_slot_id)
+    if not slot:
+        await params.result_callback({
+            "error": "Please use a valid time window: morning, midday, afternoon, or late."
+        })
         return
 
     # ── Business hours check ──
-    if not _is_business_hours(parsed_date, parsed_time[0], config):
+    if not _is_business_hours(parsed_date, slot["start_hour"], config):
         business_start = config.get("businessStart", 7)
         business_end = config.get("businessEnd", 19)
         await params.result_callback({
@@ -228,7 +234,8 @@ async def handle_create_booking(params: FunctionCallParams):
                     "customerName": name,
                     "customerPhone": phone,
                     "address": address,
-                    "date": f"{date}T{time}:00{tz_offset_formatted}",
+                    "date": f"{date}T{slot['start']}:00{tz_offset_formatted}",
+                    "timeSlot": slot["period"],
                     "notes": f"Junk Removal Pickup: {description}",
                 },
                 headers=_agent_headers(config),
@@ -238,7 +245,7 @@ async def handle_create_booking(params: FunctionCallParams):
             if resp.status == 201:
                 data = await resp.json()
                 job_id = data.get("jobId", "confirmed")
-                logger.info(f"Booking created: jobId={job_id} for {name} on {date} at {time}")
+                logger.info(f"Booking created: jobId={job_id} for {name} on {date} ({slot['period']} window)")
 
                 # Signal bot.py to start post-booking silence timer
                 ctx = _get_context()
@@ -248,7 +255,7 @@ async def handle_create_booking(params: FunctionCallParams):
                 await params.result_callback({
                     "success": True,
                     "booking_id": str(job_id),
-                    "message": f"Booking confirmed for {date} at {time}.",
+                    "message": f"Booking confirmed for {date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
                 })
             else:
                 text = await resp.text()
@@ -310,24 +317,26 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
     """Reschedule an appointment.
 
     NOTE: Dashboard endpoint /api/agent/reschedule needs to be built by developer.
-    Expected: POST /api/agent/reschedule { phone, newDate, newTime } with X-AGENT-SECRET auth
+    Expected: POST /api/agent/reschedule { phone, newDate, timeSlot } with X-AGENT-SECRET auth
     """
     config = _get_config()
     phone = params.arguments["phone"]
     new_date = params.arguments["new_date"]
-    new_time = params.arguments["new_time"]
+    new_time_slot_id = params.arguments["new_time"]
 
     parsed_date = _validate_date(new_date)
     if not parsed_date:
         await params.result_callback({"error": "Date must be YYYY-MM-DD format."})
         return
 
-    parsed_time = _validate_time(new_time)
-    if not parsed_time:
-        await params.result_callback({"error": "Time must be HH:MM format."})
+    slot = _validate_time_slot(new_time_slot_id)
+    if not slot:
+        await params.result_callback({
+            "error": "Please use a valid time window: morning, midday, afternoon, or late."
+        })
         return
 
-    if not _is_business_hours(parsed_date, parsed_time[0], config):
+    if not _is_business_hours(parsed_date, slot["start_hour"], config):
         await params.result_callback({
             "error": "That's outside our business hours."
         })
@@ -340,7 +349,7 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
                 json={
                     "phone": phone,
                     "newDate": new_date,
-                    "newTime": new_time,
+                    "timeSlot": slot["period"],
                 },
                 headers=_agent_headers(config),
                 timeout=aiohttp.ClientTimeout(total=10),
@@ -349,9 +358,9 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
         if resp.status == 200:
             await params.result_callback({
                 "success": True,
-                "message": f"Appointment rescheduled to {new_date} at {new_time}.",
+                "message": f"Appointment rescheduled to {new_date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
             })
-            logger.info(f"Rescheduled for {phone} to {new_date} at {new_time}")
+            logger.info(f"Rescheduled for {phone} to {new_date} ({slot['period']} window)")
         else:
             await params.result_callback({"error": "Couldn't reschedule that appointment."})
     except Exception as e:

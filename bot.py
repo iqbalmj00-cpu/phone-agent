@@ -79,7 +79,7 @@ tools = ToolsSchema(standard_tools=[
             "phone": {"type": "string", "description": "Customer phone number"},
             "address": {"type": "string", "description": "Service address"},
             "date": {"type": "string", "description": "YYYY-MM-DD"},
-            "time": {"type": "string", "description": "HH:MM (24-hour)"},
+            "time": {"type": "string", "description": "Time window slot ID: morning (8-10 AM), midday (10 AM-12 PM), afternoon (12-2 PM), or late (2-4 PM)"},
             "description": {"type": "string", "description": "Items for removal"},
         },
         required=["name", "phone", "address", "date", "time", "description"],
@@ -98,7 +98,7 @@ tools = ToolsSchema(standard_tools=[
         properties={
             "phone": {"type": "string", "description": "Customer phone to find booking"},
             "new_date": {"type": "string", "description": "YYYY-MM-DD"},
-            "new_time": {"type": "string", "description": "HH:MM"},
+            "new_time": {"type": "string", "description": "Time window slot ID: morning, midday, afternoon, or late"},
         },
         required=["phone", "new_date", "new_time"],
     ),

@@ -5,11 +5,12 @@ Each handler receives a FunctionCallParams object and uses the client_config
 dashboard tenant.
 
 ENDPOINT MAPPING (dashboard ↔ phone agent):
-  - check_availability → GET  /api/agent/capacity-check  (X-AGENT-SECRET auth)
-  - create_booking     → POST /api/agent/book             (X-AGENT-SECRET auth)
-  - lookup_appointment → GET  /api/agent/lookup            (X-AGENT-SECRET auth)  [NEEDS DASHBOARD ENDPOINT]
-  - reschedule         → POST /api/agent/reschedule        (X-AGENT-SECRET auth)  [NEEDS DASHBOARD ENDPOINT]
-  - cancel             → POST /api/agent/cancel            (X-AGENT-SECRET auth)  [NEEDS DASHBOARD ENDPOINT]
+  - check_availability    → GET  /api/agent/capacity-check  (X-AGENT-SECRET auth)
+  - create_booking        → POST /api/agent/book             (X-AGENT-SECRET auth)
+  - lookup_appointment    → GET  /api/agent/lookup            (X-AGENT-SECRET auth)
+  - reschedule            → POST /api/agent/reschedule        (X-AGENT-SECRET auth)
+  - cancel                → POST /api/agent/cancel            (X-AGENT-SECRET auth)
+  - transfer_to_human     → Twilio REST API (call redirect)
 """
 
 import asyncio
@@ -45,6 +46,12 @@ def mark_booking_complete(call_sid: str):
     """Flag that a booking was successfully created for this call."""
     if call_sid in _call_contexts:
         _call_contexts[call_sid]["booking_complete"] = True
+
+
+def set_pipeline_task(call_sid: str, task):
+    """Store the PipelineTask so handlers can cancel it (e.g. after transfer)."""
+    if call_sid in _call_contexts:
+        _call_contexts[call_sid]["pipeline_task"] = task
 
 
 def is_booking_complete(call_sid: str) -> bool:
@@ -415,3 +422,94 @@ def _format_hour(hour: int) -> str:
         return "12:00 PM"
     else:
         return f"{hour - 12}:00 PM"
+
+
+# ── Twilio Client (lazy singleton for call transfers) ──
+
+_twilio_client = None
+
+
+def _get_twilio_client():
+    """Get or create Twilio REST client for call operations."""
+    global _twilio_client
+    if _twilio_client is None:
+        from twilio.rest import Client as TwilioClient
+        _twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    return _twilio_client
+
+
+# ── Human Handoff ──────────────────────────────────────
+
+async def handle_transfer_to_human(params: FunctionCallParams):
+    """Transfer the live call to the client's forwarding phone number.
+
+    Uses Twilio's REST API to update the active call with <Dial> TwiML,
+    which redirects the caller to the client's number. The AI pipeline
+    is then cancelled since the call audio stream will end.
+
+    Requires 'forwardingPhone' in the client config (set via dashboard).
+    """
+    config = _get_config()
+    ctx = _get_context()
+    reason = params.arguments.get("reason", "Caller requested human agent")
+    call_sid = ctx.get("call_sid")
+    forwarding_phone = config.get("forwardingPhone", "")
+
+    # No forwarding number configured — take a message instead
+    if not forwarding_phone:
+        logger.warning(f"No forwardingPhone configured — cannot transfer call {call_sid}")
+        await params.result_callback({
+            "transferred": False,
+            "message": (
+                "I'm not able to transfer you right now, but I've noted your request. "
+                "Someone from our team will call you back shortly. "
+                "Is there anything else I can help you with in the meantime?"
+            ),
+        })
+        return
+
+    if not call_sid:
+        logger.error("No call_sid in context — cannot transfer")
+        await params.result_callback({
+            "transferred": False,
+            "message": "I'm having trouble with the transfer. Let me take your info and have someone call you back.",
+        })
+        return
+
+    # Build TwiML to redirect the call
+    company_name = config.get("companyName", "our team")
+    transfer_twiml = (
+        f'<Response>'
+        f'<Say voice="Polly.Joanna">Please hold while we connect you with {company_name}.</Say>'
+        f'<Dial callerId="{config.get("twilioNumber", "")}">{forwarding_phone}</Dial>'
+        f'<Say voice="Polly.Joanna">We were unable to reach anyone at this time. Please try again later. Goodbye.</Say>'
+        f'</Response>'
+    )
+
+    try:
+        # Twilio SDK is synchronous — run in thread executor
+        client = _get_twilio_client()
+        await asyncio.to_thread(
+            client.calls(call_sid).update,
+            twiml=transfer_twiml,
+        )
+
+        logger.info(f"Call {call_sid} transferred to {forwarding_phone} (reason: {reason})")
+
+        await params.result_callback({
+            "transferred": True,
+            "message": "Transferring the call now.",
+        })
+
+        # Cancel the AI pipeline — the call audio stream will end
+        pipeline_task = ctx.get("pipeline_task")
+        if pipeline_task:
+            await asyncio.sleep(2)  # Brief delay so the TTS can finish speaking
+            await pipeline_task.cancel()
+
+    except Exception as e:
+        logger.error(f"Transfer failed for call {call_sid}: {e}")
+        await params.result_callback({
+            "transferred": False,
+            "message": "I'm having trouble with the transfer right now. Let me take your info and have someone call you back within the hour.",
+        })

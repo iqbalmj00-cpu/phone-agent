@@ -61,7 +61,9 @@ from agent.handlers import (
     handle_lookup_appointment,
     handle_reschedule_appointment,
     handle_cancel_appointment,
+    handle_transfer_to_human,
     set_call_context,
+    set_pipeline_task,
     clear_call_context,
     is_booking_complete,
 )
@@ -110,6 +112,14 @@ tools = ToolsSchema(standard_tools=[
             "reason": {"type": "string", "description": "Reason for cancellation"},
         },
         required=["phone"],
+    ),
+    FunctionSchema(
+        name="transfer_to_human",
+        description="Transfer the live call to a human team member. Use when the caller explicitly asks to speak to a real person, has a complaint or billing dispute, or after repeated tool failures.",
+        properties={
+            "reason": {"type": "string", "description": "Why the caller wants to be transferred"},
+        },
+        required=["reason"],
     ),
 ])
 
@@ -214,6 +224,9 @@ async def run_bot(
     llm.register_function(
         "cancel_appointment", handle_cancel_appointment, cancel_on_interruption=False
     )
+    llm.register_function(
+        "transfer_to_human", handle_transfer_to_human, cancel_on_interruption=False
+    )
 
     # ── Pipeline ────────────────────────────────────────
     sentence_aggregator = SentenceAggregator()
@@ -241,6 +254,9 @@ async def run_bot(
             enable_usage_metrics=True,
         ),
     )
+
+    # Give handlers access to the task for pipeline cancellation (e.g. after transfer)
+    set_pipeline_task(call_id, task)
 
     # ── Event Handlers ──────────────────────────────────
 

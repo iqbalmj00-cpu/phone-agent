@@ -202,6 +202,11 @@ async def handle_create_booking(params: FunctionCallParams):
     date = params.arguments["date"]
     time_slot_id = params.arguments["time"]
     description = params.arguments["description"]
+    booking_type = params.arguments.get("type", "pickup")
+    container_size = params.arguments.get("container_size")
+    rental_duration_days = params.arguments.get("rental_duration_days", 7)
+
+    is_dumpster = booking_type == "dumpster_rental"
 
     # ── Validate date ──
     parsed_date = _validate_date(date)
@@ -226,6 +231,13 @@ async def handle_create_booking(params: FunctionCallParams):
         })
         return
 
+    # ── Build notes ──
+    if is_dumpster:
+        size_str = f"{container_size}-yard" if container_size else "TBD size"
+        notes = f"Dumpster Rental Delivery: {size_str} container, {rental_duration_days} day rental. Project: {description}"
+    else:
+        notes = f"Junk Removal Pickup: {description}"
+
     # ── Create booking via /api/agent/book ──
     company_name = config.get("companyName", "the company")
     tz = config.get("timezone", "America/Chicago")
@@ -233,18 +245,25 @@ async def handle_create_booking(params: FunctionCallParams):
     # Format offset as -06:00 (insert colon)
     tz_offset_formatted = f"{tz_offset[:3]}:{tz_offset[3:]}" if len(tz_offset) == 5 else tz_offset
 
+    payload = {
+        "customerName": name,
+        "customerPhone": phone,
+        "address": address,
+        "date": f"{date}T{slot['start']}:00{tz_offset_formatted}",
+        "timeSlot": slot["period"],
+        "notes": notes,
+        "type": booking_type,
+        "serviceType": "dumpster_rental" if is_dumpster else "junk_removal",
+    }
+    if is_dumpster:
+        payload["containerSize"] = container_size
+        payload["rentalDays"] = rental_duration_days
+
     try:
         async with aiohttp.ClientSession() as http:
             resp = await http.post(
                 f"{DASHBOARD_URL}/api/agent/book",
-                json={
-                    "customerName": name,
-                    "customerPhone": phone,
-                    "address": address,
-                    "date": f"{date}T{slot['start']}:00{tz_offset_formatted}",
-                    "timeSlot": slot["period"],
-                    "notes": f"Junk Removal Pickup: {description}",
-                },
+                json=payload,
                 headers=_agent_headers(config),
                 timeout=aiohttp.ClientTimeout(total=15),
             )
@@ -252,18 +271,27 @@ async def handle_create_booking(params: FunctionCallParams):
             if resp.status == 201:
                 data = await resp.json()
                 job_id = data.get("jobId", "confirmed")
-                logger.info(f"Booking created: jobId={job_id} for {name} on {date} ({slot['period']} window)")
+                label = "Dumpster rental" if is_dumpster else "Booking"
+                logger.info(f"{label} created: jobId={job_id} for {name} on {date} ({slot['period']} window)")
 
                 # Signal bot.py to start post-booking silence timer
                 ctx = _get_context()
                 if ctx.get("call_sid"):
                     mark_booking_complete(ctx["call_sid"])
 
-                await params.result_callback({
-                    "success": True,
-                    "booking_id": str(job_id),
-                    "message": f"Booking confirmed for {date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
-                })
+                if is_dumpster:
+                    size_label = f"{container_size}-yard" if container_size else ""
+                    await params.result_callback({
+                        "success": True,
+                        "booking_id": str(job_id),
+                        "message": f"Dumpster rental request submitted for {date}. {size_label} container, {rental_duration_days} day rental. Our team will follow up with exact pricing.",
+                    })
+                else:
+                    await params.result_callback({
+                        "success": True,
+                        "booking_id": str(job_id),
+                        "message": f"Booking confirmed for {date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
+                    })
             else:
                 text = await resp.text()
                 logger.error(f"Booking API error: {resp.status} {text}")

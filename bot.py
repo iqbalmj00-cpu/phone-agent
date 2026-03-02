@@ -75,16 +75,19 @@ from agent.context import should_compress, compress_context
 tools = ToolsSchema(standard_tools=[
     FunctionSchema(
         name="create_booking",
-        description="Book a junk removal pickup. ONLY call this after reading back all details and receiving verbal confirmation from the caller.",
+        description="Book a junk removal pickup or dumpster rental. ONLY call this after reading back all details and receiving verbal confirmation from the caller.",
         properties={
             "name": {"type": "string", "description": "Customer full name"},
             "phone": {"type": "string", "description": "Customer phone number"},
             "address": {"type": "string", "description": "Service address"},
             "date": {"type": "string", "description": "YYYY-MM-DD"},
             "time": {"type": "string", "description": "Time window slot ID: morning (8-10 AM), midday (10 AM-12 PM), afternoon (12-2 PM), or late (2-4 PM)"},
-            "description": {"type": "string", "description": "Items for removal"},
+            "description": {"type": "string", "description": "Items for removal or project description for dumpster"},
+            "type": {"type": "string", "enum": ["pickup", "in_person_estimate", "dumpster_rental"], "description": "Type of appointment. Use 'dumpster_rental' for dumpster deliveries."},
+            "container_size": {"type": "string", "enum": ["10", "15", "20", "30", "40"], "description": "Container size in cubic yards (only for dumpster_rental)"},
+            "rental_duration_days": {"type": "integer", "description": "Rental duration in days, default 7 (only for dumpster_rental)"},
         },
-        required=["name", "phone", "address", "date", "time", "description"],
+        required=["name", "phone", "address", "date", "time", "description", "type"],
     ),
     FunctionSchema(
         name="lookup_appointment",

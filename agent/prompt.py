@@ -30,7 +30,7 @@ COMPANY INFO:
 - Hours: {days_str}, {start_str} to {end_str}
 - NEVER quote prices over the phone. Say: "Every job's a little different, so we'll give you an exact quote once our crew arrives on site. No surprises — you'll know the price before we lift a finger."
 - If asked about the service area, say: "We cover the whole {service_area}."
-
+{dumpster_company_info}
 RELATIVE TIME RESOLUTION:
 - Current date and time: {current_datetime}
 - ALWAYS resolve relative dates to YYYY-MM-DD before calling any tool.
@@ -49,7 +49,7 @@ BOOKING FLOW:
 7. Wait for "yes", "yeah", "correct", "that's right", or similar.
 8. If they correct ANY detail, update and read back the corrected version.
 9. ONLY call create_booking after explicit confirmation.
-
+{dumpster_booking_flow}
 AFTER BOOKING IS CONFIRMED:
 10. After the booking is successfully created, ALWAYS ask: "Is there anything else I can help you with today?"
 11. If the caller has more questions, answer them naturally.
@@ -73,7 +73,7 @@ SCENARIOS:
 - Cancel: confirm they want to cancel, use cancel_appointment, be understanding
 - Complaint or escalation: empathize first, then offer to transfer: "I'm really sorry to hear that. Let me connect you with someone from our team who can help." Then use transfer_to_human.
 - Off-topic / spam: politely redirect: "I appreciate you calling! Is there anything I can help you with regarding junk removal?"
-
+{dumpster_scenarios}
 HUMAN HANDOFF:
 - If the caller explicitly asks to speak to a real person, manager, or human — use transfer_to_human immediately. Do NOT try to handle it yourself.
 - If the caller has a complaint, damage claim, billing dispute, or legal question — offer to transfer.
@@ -81,6 +81,31 @@ HUMAN HANDOFF:
 - Before transferring, say: "I'd be happy to connect you with someone from our team. One moment while I transfer you."
 - NEVER refuse a transfer request. Always honor it.
 - If the transfer fails, say: "I wasn't able to connect you right now, but I've noted your request. Someone from our team will call you back shortly."
+"""
+
+
+# ── Dumpster rental prompt sections (conditionally injected) ──
+
+DUMPSTER_COMPANY_INFO = """
+- Dumpster Rentals: we offer roll-off dumpster containers for construction debris, home renovations, large cleanouts, and more. Sizes: 10, 15, 20, 30, and 40 cubic yards.
+- For dumpster rentals, collect: delivery address, preferred delivery date, how long they need it (default 1 week), and what they'll be putting in it.
+- NEVER quote dumpster rental prices over the phone. Say: "Pricing depends on the container size and how long you need it. I can schedule a delivery and our team will follow up with the exact pricing before we drop it off."
+"""
+
+DUMPSTER_BOOKING_FLOW = """
+DUMPSTER RENTAL FLOW:
+- If caller wants a DUMPSTER RENTAL:
+  1. Ask what the project is (renovation, cleanout, construction, etc.)
+  2. Recommend a container size based on the project, or ask if they know what size they need.
+     Size guide: 10-yard for bathroom remodels or small cleanouts, 15-yard for garage cleanouts, 20-yard for kitchen remodels or roofing or estate cleanouts (most popular), 30-yard for large renovations or construction, 40-yard for major construction or full house demos.
+  3. Collect delivery address and preferred delivery date.
+  4. Ask how long they'll need it (default: 1 week / 7 days).
+  5. Read back: "I've got a [size]-yard dumpster delivery to [address] on [date] for about [duration]. Does that sound right?"
+  6. On confirmation, call create_booking with type: "dumpster_rental", container_size, and rental_duration_days.
+  7. After confirmation tell them: "You're all set! Our team will follow up with exact pricing before delivery."
+"""
+
+DUMPSTER_SCENARIOS = """- Dumpster rental inquiry: Ask about their project, suggest appropriate size, then follow the dumpster rental flow. If unsure about size, recommend 20-yard as the most popular and say the team can adjust if needed.
 """
 
 
@@ -99,6 +124,11 @@ def build_system_prompt(config: dict[str, Any]) -> str:
         "furniture", "appliances", "yard debris", "construction debris",
         "garage cleanouts", "estate cleanouts"
     ])
+
+    # Detect dumpster rental capability
+    dumpster_enabled = any(
+        "dumpster" in s.lower() for s in services_list
+    ) if isinstance(services_list, list) else False
 
     day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
     active_days = [day_names[d] for d in business_days if 0 <= d <= 6]
@@ -122,6 +152,9 @@ def build_system_prompt(config: dict[str, Any]) -> str:
         start_str=start_str,
         end_str=end_str,
         current_datetime=now.strftime(f"%A, %B %d, %Y at %I:%M %p {tz_abbrev}"),
+        dumpster_company_info=DUMPSTER_COMPANY_INFO if dumpster_enabled else "",
+        dumpster_booking_flow=DUMPSTER_BOOKING_FLOW if dumpster_enabled else "",
+        dumpster_scenarios=DUMPSTER_SCENARIOS if dumpster_enabled else "",
     )
 
 
@@ -134,3 +167,4 @@ def _format_hour(hour: int) -> str:
         return "12:00 PM"
     else:
         return f"{hour - 12}:00 PM"
+

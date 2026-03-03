@@ -75,16 +75,16 @@ from agent.context import should_compress, compress_context
 tools = ToolsSchema(standard_tools=[
     FunctionSchema(
         name="create_booking",
-        description="Book a junk removal pickup or dumpster rental. ONLY call this after reading back all details and receiving verbal confirmation from the caller.",
+        description="Book a junk removal pickup, dumpster rental, or dumpster swap. ONLY call this after reading back all details and receiving verbal confirmation from the caller.",
         properties={
             "name": {"type": "string", "description": "Customer full name"},
             "phone": {"type": "string", "description": "Customer phone number"},
             "address": {"type": "string", "description": "Service address"},
             "date": {"type": "string", "description": "YYYY-MM-DD"},
             "time": {"type": "string", "description": "Time window slot ID: morning (8-10 AM), midday (10 AM-12 PM), afternoon (12-2 PM), or late (2-4 PM)"},
-            "description": {"type": "string", "description": "Items for removal or project description for dumpster"},
-            "type": {"type": "string", "enum": ["pickup", "in_person_estimate", "dumpster_rental"], "description": "Type of appointment. Use 'dumpster_rental' for dumpster deliveries."},
-            "container_size": {"type": "string", "enum": ["10", "15", "20", "30", "40"], "description": "Container size in cubic yards (only for dumpster_rental)"},
+            "description": {"type": "string", "description": "Items for removal, project description for dumpster, or swap reason"},
+            "type": {"type": "string", "enum": ["pickup", "in_person_estimate", "dumpster_rental", "dumpster_swap"], "description": "Type of appointment. Use 'dumpster_rental' for new deliveries, 'dumpster_swap' for swapping a full container for an empty one."},
+            "container_size": {"type": "string", "enum": ["10", "15", "20", "30", "40"], "description": "Container size in cubic yards (for dumpster_rental or dumpster_swap)"},
             "rental_duration_days": {"type": "integer", "description": "Rental duration in days, default 7 (only for dumpster_rental)"},
         },
         required=["name", "phone", "address", "date", "time", "description", "type"],

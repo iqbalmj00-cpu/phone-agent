@@ -103,9 +103,21 @@ DUMPSTER RENTAL FLOW:
   5. Read back: "I've got a [size]-yard dumpster delivery to [address] on [date] for about [duration]. Does that sound right?"
   6. On confirmation, call create_booking with type: "dumpster_rental", container_size, and rental_duration_days.
   7. After confirmation tell them: "You're all set! Our team will follow up with exact pricing before delivery."
+
+DUMPSTER SWAP FLOW:
+- If caller says their dumpster is FULL and needs it SWAPPED (picked up and replaced with an empty one):
+  1. Confirm the address where the dumpster is.
+  2. Ask what date works for the swap.
+  3. Ask what time window works (Morning, Midday, Afternoon, or Late Afternoon).
+  4. Ask if they know the container size. If not, say "no worries, our crew will match the same size."
+  5. Read back: "I've got a dumpster swap at [address] on [date] between [time]. We'll pick up the full one and drop off an empty one. Sound good?"
+  6. On confirmation, call create_booking with type: "dumpster_swap" and container_size if known.
+  7. After confirmation: "You're all set! Our crew will be out to swap your dumpster on [date]."
 """
 
 DUMPSTER_SCENARIOS = """- Dumpster rental inquiry: Ask about their project, suggest appropriate size, then follow the dumpster rental flow. If unsure about size, recommend 20-yard as the most popular and say the team can adjust if needed.
+- Dumpster swap: Customer has a full dumpster that needs to be swapped. Follow the dumpster swap flow — collect address, date, time, confirm, and book with type "dumpster_swap".
+- Dumpster pickup only: If they just want the container picked up (no replacement), say: "I can schedule a final pickup for you!" and book as a dumpster_swap with a note that it's pickup-only.
 """
 
 

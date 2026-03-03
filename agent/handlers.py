@@ -206,7 +206,8 @@ async def handle_create_booking(params: FunctionCallParams):
     container_size = params.arguments.get("container_size")
     rental_duration_days = params.arguments.get("rental_duration_days", 7)
 
-    is_dumpster = booking_type == "dumpster_rental"
+    is_dumpster = booking_type in ("dumpster_rental", "dumpster_swap")
+    is_swap = booking_type == "dumpster_swap"
 
     # ── Validate date ──
     parsed_date = _validate_date(date)
@@ -232,7 +233,10 @@ async def handle_create_booking(params: FunctionCallParams):
         return
 
     # ── Build notes ──
-    if is_dumpster:
+    if is_swap:
+        size_str = f"{container_size}-yard" if container_size else "current size"
+        notes = f"Dumpster Swap: pick up full {size_str} container, drop off empty. {description}"
+    elif is_dumpster:
         size_str = f"{container_size}-yard" if container_size else "TBD size"
         notes = f"Dumpster Rental Delivery: {size_str} container, {rental_duration_days} day rental. Project: {description}"
     else:
@@ -279,7 +283,13 @@ async def handle_create_booking(params: FunctionCallParams):
                 if ctx.get("call_sid"):
                     mark_booking_complete(ctx["call_sid"])
 
-                if is_dumpster:
+                if is_swap:
+                    await params.result_callback({
+                        "success": True,
+                        "booking_id": str(job_id),
+                        "message": f"Dumpster swap scheduled for {date}, {slot['period']} window. We'll pick up the full container and drop off an empty one.",
+                    })
+                elif is_dumpster:
                     size_label = f"{container_size}-yard" if container_size else ""
                     await params.result_callback({
                         "success": True,

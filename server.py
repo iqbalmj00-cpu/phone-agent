@@ -85,7 +85,7 @@ async def twiml_webhook(client_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Client not found")
 
     # ── Starter tier: gate to business hours only ──
-    tier = config.get("tier", "starter")
+    tier = config.get("planTier", "starter")
     if tier == "starter" and not _is_within_business_hours(config):
         company = config.get("companyName", "us")
         hours_label = _format_hours_label(config)

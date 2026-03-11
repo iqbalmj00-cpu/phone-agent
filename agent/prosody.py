@@ -43,7 +43,7 @@ class CartesiaContinuationTTS(CartesiaTTSService):
 
 # ── Phone number patterns ───────────────────────────────
 _PHONE_PAREN = re.compile(r"\((\d{3})\)\s*(\d{3}[-.]?\d{4})")
-_PHONE_DASH = re.compile(r"(\d{3})[-.](\.{3}[-.]?\d{4})")
+_PHONE_DASH = re.compile(r"(\d{3})[-.](\d{3}[-.]?\d{4})")
 
 
 def inject_prosody(text: str) -> str:

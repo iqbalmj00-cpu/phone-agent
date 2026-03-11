@@ -66,6 +66,7 @@ from agent.handlers import (
     set_pipeline_task,
     clear_call_context,
     is_booking_complete,
+    _current_call_sid,
 )
 from agent.context import should_compress, compress_context
 
@@ -135,6 +136,9 @@ async def run_bot(
     client_config: dict[str, Any],
 ):
     """Build and run the Pipecat pipeline for a single call."""
+
+    # Set the call_sid context var so all handlers know which call they belong to
+    _current_call_sid.set(call_id)
 
     # Extract client-specific values
     agent_name = client_config.get("agentName", "Sarah")
@@ -313,33 +317,38 @@ async def run_bot(
         nonlocal last_caller_speech_time
         last_caller_speech_time = datetime.now(ZoneInfo(timezone))
 
+        # Compress context if message count is getting high (long calls)
+        if should_compress(context.messages):
+            try:
+                summary_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+                context.messages = await compress_context(context.messages, summary_client)
+            except Exception as e:
+                logger.warning(f"Context compression failed (non-fatal): {e}")
+
     # ── Post-Booking Silence Watcher ───────────────────
 
     async def _post_booking_watcher(task, context, cid: str):
-        """After a booking completes, prompt the agent to ask if they need
-        anything else and only hang up after extended silence (safety net)."""
-        POST_BOOKING_SILENCE_SECONDS = 90  # safety net — longer timeout
+        """After a booking completes, wait for the LLM to finish its natural
+        response, then start a 20s silence timer. If the caller speaks, the
+        timer resets. Only hang up after 20s of total silence."""
+        POST_BOOKING_SILENCE_SECONDS = 20
 
         try:
             # Phase 1: Wait for booking to complete
             while not is_booking_complete(cid):
                 await asyncio.sleep(2)
 
-            logger.info(f"Booking complete for {cid} — prompting agent to ask if customer needs anything else")
+            logger.info(f"Booking complete for {cid} — starting post-booking silence watcher")
 
-            # Nudge the LLM to ask if the customer needs anything else
-            context.messages.append({
-                "role": "system",
-                "content": (
-                    "The booking was just confirmed. Now ask the customer: "
-                    "'Is there anything else I can help you with today?' "
-                    "Wait for their response. If they have more questions, help them. "
-                    "Only say goodbye after they confirm they're all set."
-                ),
-            })
-            await task.queue_frames([LLMMessagesFrame(context.messages)])
+            # Give the LLM time to finish its natural response
+            # (the system prompt already instructs it to ask "anything else?")
+            await asyncio.sleep(10)
 
-            # Phase 2: Safety net — if caller goes completely silent for 90s, wrap up
+            # Reset speech timer so the 20s countdown starts fresh
+            nonlocal last_caller_speech_time
+            last_caller_speech_time = datetime.now(ZoneInfo(timezone))
+
+            # Phase 2: 20s silence timer with speech reset
             while True:
                 now = datetime.now(ZoneInfo(timezone))
                 elapsed = (now - last_caller_speech_time).total_seconds()
@@ -357,7 +366,7 @@ async def run_bot(
                     await task.cancel()
                     return
 
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)
 
         except asyncio.CancelledError:
             pass  # Call ended before silence timer fired

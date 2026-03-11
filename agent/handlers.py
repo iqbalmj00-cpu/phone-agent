@@ -14,6 +14,7 @@ ENDPOINT MAPPING (dashboard ↔ phone agent):
 """
 
 import asyncio
+import contextvars
 import aiohttp
 from datetime import datetime
 from typing import Any
@@ -26,6 +27,7 @@ from config import DASHBOARD_URL, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
 
 # ── Per-call context — keyed by call_sid for concurrency safety ──
 _call_contexts: dict[str, dict[str, Any]] = {}
+_current_call_sid: contextvars.ContextVar[str] = contextvars.ContextVar("current_call_sid", default="")
 
 
 def set_call_context(call_sid: str, caller_number: str, client_config: dict[str, Any]):
@@ -61,16 +63,17 @@ def is_booking_complete(call_sid: str) -> bool:
 
 
 def _get_context() -> dict[str, Any]:
-    """Get the most recent call context.
+    """Get the call context for the current pipeline.
 
-    NOTE: For true multi-call safety, handlers would need the call_sid
-    passed through. Pipecat's FunctionCallParams doesn't carry it, so
-    we use the most recently set context. This works because each call
-    runs in its own pipeline and tool calls are sequential within a call.
+    Uses contextvars to identify the correct call_sid for this asyncio task,
+    ensuring concurrent calls always use their own config.
     """
+    call_sid = _current_call_sid.get()
+    if call_sid and call_sid in _call_contexts:
+        return _call_contexts[call_sid]
+    # Fallback for single-call scenarios
     if not _call_contexts:
         return {}
-    # Return the most recently added context
     return list(_call_contexts.values())[-1]
 
 
@@ -335,22 +338,22 @@ async def handle_lookup_appointment(params: FunctionCallParams):
                 timeout=aiohttp.ClientTimeout(total=10),
             )
 
-        if resp.status == 200:
-            data = await resp.json()
-            if data.get("found"):
-                await params.result_callback({
-                    "found": True,
-                    "booking": data.get("appointment", {}),
-                })
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("found"):
+                    await params.result_callback({
+                        "found": True,
+                        "booking": data.get("appointment", {}),
+                    })
+                else:
+                    await params.result_callback({
+                        "found": False,
+                        "message": "No appointments found for that number."
+                    })
             else:
                 await params.result_callback({
-                    "found": False,
-                    "message": "No appointments found for that number."
+                    "error": "I'm having trouble looking that up. Can you give me your name instead?"
                 })
-        else:
-            await params.result_callback({
-                "error": "I'm having trouble looking that up. Can you give me your name instead?"
-            })
     except Exception as e:
         logger.error(f"Appointment lookup failed: {e}")
         await params.result_callback({
@@ -400,14 +403,14 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
                 timeout=aiohttp.ClientTimeout(total=10),
             )
 
-        if resp.status == 200:
-            await params.result_callback({
-                "success": True,
-                "message": f"Appointment rescheduled to {new_date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
-            })
-            logger.info(f"Rescheduled for {phone} to {new_date} ({slot['period']} window)")
-        else:
-            await params.result_callback({"error": "Couldn't reschedule that appointment."})
+            if resp.status == 200:
+                await params.result_callback({
+                    "success": True,
+                    "message": f"Appointment rescheduled to {new_date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
+                })
+                logger.info(f"Rescheduled for {phone} to {new_date} ({slot['period']} window)")
+            else:
+                await params.result_callback({"error": "Couldn't reschedule that appointment."})
     except Exception as e:
         logger.error(f"Reschedule error: {e}")
         await params.result_callback({"error": "I'm having trouble rescheduling right now."})
@@ -436,14 +439,14 @@ async def handle_cancel_appointment(params: FunctionCallParams):
                 timeout=aiohttp.ClientTimeout(total=10),
             )
 
-        if resp.status == 200:
-            await params.result_callback({
-                "success": True,
-                "message": "Appointment cancelled.",
-            })
-            logger.info(f"Cancelled appointment for {phone}, reason: {reason}")
-        else:
-            await params.result_callback({"error": "Couldn't cancel that appointment."})
+            if resp.status == 200:
+                await params.result_callback({
+                    "success": True,
+                    "message": "Appointment cancelled.",
+                })
+                logger.info(f"Cancelled appointment for {phone}, reason: {reason}")
+            else:
+                await params.result_callback({"error": "Couldn't cancel that appointment."})
     except Exception as e:
         logger.error(f"Cancel error: {e}")
         await params.result_callback({"error": "I'm having trouble processing the cancellation."})

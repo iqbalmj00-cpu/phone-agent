@@ -84,6 +84,10 @@ async def twiml_webhook(client_id: str, request: Request):
         logger.error(f"Client config error for {client_id}: {e}")
         raise HTTPException(status_code=404, detail="Client not found")
 
+    # Extract caller's phone number from Twilio's POST form data
+    form_data = await request.form()
+    from_number = form_data.get("From", "")
+
     # ── Starter tier: gate to business hours only ──
     tier = config.get("planTier", "starter")
     if tier == "starter" and not _is_within_business_hours(config):
@@ -114,6 +118,7 @@ async def twiml_webhook(client_id: str, request: Request):
     <Connect>
         <Stream url="{ws_url}">
             <Parameter name="client_id" value="{client_id}" />
+            <Parameter name="From" value="{from_number}" />
         </Stream>
     </Connect>
 </Response>"""

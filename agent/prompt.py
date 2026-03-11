@@ -93,9 +93,9 @@ HUMAN HANDOFF:
 # ── Dumpster rental prompt sections (conditionally injected) ──
 
 DUMPSTER_COMPANY_INFO = """
-- Dumpster Rentals: we offer roll-off dumpster containers for construction debris, home renovations, large cleanouts, and more. Sizes: 10, 15, 20, 30, and 40 cubic yards.
+- Dumpster Rentals: we offer roll-off dumpster containers for construction debris, home renovations, large cleanouts, and more.
 - For dumpster rentals, collect: delivery address, preferred delivery date, how long they need it (default 1 week), and what they'll be putting in it.
-- NEVER quote dumpster rental prices over the phone. Say: "Pricing depends on the container size and how long you need it. I can schedule a delivery and our team will follow up with the exact pricing before we drop it off."
+{dumpster_pricing_block}
 """
 
 DUMPSTER_BOOKING_FLOW = """
@@ -104,24 +104,32 @@ DUMPSTER RENTAL FLOW:
   1. Ask what the project is (renovation, cleanout, construction, etc.)
   2. Recommend a container size based on the project, or ask if they know what size they need.
      Size guide: 10-yard for bathroom remodels or small cleanouts, 15-yard for garage cleanouts, 20-yard for kitchen remodels or roofing or estate cleanouts (most popular), 30-yard for large renovations or construction, 40-yard for major construction or full house demos.
-  3. Collect delivery address and preferred delivery date.
-  4. Ask how long they'll need it (default: 1 week / 7 days).
-  5. Read back: "I've got a [size]-yard dumpster delivery to [address] on [date] for about [duration]. Does that sound right?"
-  6. On confirmation, call create_booking with type: "dumpster_rental", container_size, and rental_duration_days.
-  7. After confirmation tell them: "You're all set! Our team will follow up with exact pricing before delivery."
+  3. {dumpster_price_instruction}
+  4. Collect delivery address and preferred delivery date.
+  5. Ask how long they'll need it (default: 1 week / 7 days).
+  6. Read back: "I've got a [size]-yard dumpster delivery to [address] on [date] for about [duration]. Does that sound right?"
+  7. On confirmation, call create_booking with type: "dumpster_rental", container_size, and rental_duration_days.
+  8. After confirmation: "You're all set! We'll send you a text before delivery."
 
 DUMPSTER SWAP FLOW:
 - If caller says their dumpster is FULL and needs it SWAPPED (picked up and replaced with an empty one):
   1. Confirm the address where the dumpster is.
-  2. Ask what date works for the swap.
-  3. Ask what time window works (Morning, Midday, Afternoon, or Late Afternoon).
+  2. Ask what date and time work for the swap.
+  3. Map their preferred time to the closest time window (same as junk removal). Say: "We work in time windows — can we arrive between [start] and [end]?"
   4. Ask if they know the container size. If not, say "no worries, our crew will match the same size."
-  5. Read back: "I've got a dumpster swap at [address] on [date] between [time]. We'll pick up the full one and drop off an empty one. Sound good?"
-  6. On confirmation, call create_booking with type: "dumpster_swap" and container_size if known.
-  7. After confirmation: "You're all set! Our crew will be out to swap your dumpster on [date]."
+  5. {dumpster_swap_price_instruction}
+  6. Read back: "I've got a dumpster swap at [address] on [date] between [time]. We'll pick up the full one and drop off an empty one. Sound good?"
+  7. On confirmation, call create_booking with type: "dumpster_swap" and container_size if known.
+  8. After confirmation: "You're all set! Our crew will be out to swap your dumpster on [date]."
+
+DUMPSTER EXTENDED RENTAL:
+- If the caller asks "What if I need it more than {included_days} days?" or about keeping it longer:
+  {dumpster_extension_instruction}
+- For commercial callers who need recurring weekly swaps or long-term rentals, offer to have the team reach out about a commercial account for the best rate.
 """
 
 DUMPSTER_SCENARIOS = """- Dumpster rental inquiry: Ask about their project, suggest appropriate size, then follow the dumpster rental flow. If unsure about size, recommend 20-yard as the most popular and say the team can adjust if needed.
+- Dumpster pricing question: If they ask "how much" — give the price for the size they're asking about. If they haven't said a size, ask about their project first, then quote the recommended size.
 - Dumpster swap: Customer has a full dumpster that needs to be swapped. Follow the dumpster swap flow — collect address, date, time, confirm, and book with type "dumpster_swap".
 - Dumpster pickup only: If they just want the container picked up (no replacement), say: "I can schedule a final pickup for you!" and book as a dumpster_swap with a note that it's pickup-only.
 """
@@ -148,6 +156,10 @@ def build_system_prompt(config: dict[str, Any]) -> str:
         "dumpster" in s.lower() for s in services_list
     ) if isinstance(services_list, list) else False
 
+    # Dumpster pricing data (from dashboard config)
+    dumpster_pricing = config.get("dumpsterPricing", [])
+    pricing_block, price_instruction, swap_price_instruction, extension_instruction, included_days = _format_dumpster_pricing(dumpster_pricing)
+
     day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
     active_days = [day_names[d] for d in business_days if 0 <= d <= 6]
     days_str = f"{active_days[0]} through {active_days[-1]}" if len(active_days) > 1 else active_days[0] if active_days else "Monday through Saturday"
@@ -158,6 +170,20 @@ def build_system_prompt(config: dict[str, Any]) -> str:
 
     now = datetime.now(ZoneInfo(timezone))
     tz_abbrev = now.strftime("%Z") or timezone.split("/")[-1]
+
+    # Build dumpster sections with pricing injected
+    dumpster_info = ""
+    dumpster_flow = ""
+    dumpster_scen = ""
+    if dumpster_enabled:
+        dumpster_info = DUMPSTER_COMPANY_INFO.format(dumpster_pricing_block=pricing_block)
+        dumpster_flow = DUMPSTER_BOOKING_FLOW.format(
+            dumpster_price_instruction=price_instruction,
+            dumpster_swap_price_instruction=swap_price_instruction,
+            dumpster_extension_instruction=extension_instruction,
+            included_days=included_days,
+        )
+        dumpster_scen = DUMPSTER_SCENARIOS
 
     return SYSTEM_PROMPT_TEMPLATE.format(
         agent_name=agent_name,
@@ -170,10 +196,65 @@ def build_system_prompt(config: dict[str, Any]) -> str:
         start_str=start_str,
         end_str=end_str,
         current_datetime=now.strftime(f"%A, %B %d, %Y at %I:%M %p {tz_abbrev}"),
-        dumpster_company_info=DUMPSTER_COMPANY_INFO if dumpster_enabled else "",
-        dumpster_booking_flow=DUMPSTER_BOOKING_FLOW if dumpster_enabled else "",
-        dumpster_scenarios=DUMPSTER_SCENARIOS if dumpster_enabled else "",
+        dumpster_company_info=dumpster_info,
+        dumpster_booking_flow=dumpster_flow,
+        dumpster_scenarios=dumpster_scen,
     )
+
+
+def _format_dumpster_pricing(tiers: list[dict]) -> tuple[str, str, str, str, int]:
+    """Format dumpster pricing tiers into prompt-friendly strings.
+
+    Returns: (pricing_block, price_instruction, swap_price_instruction, extension_instruction, included_days)
+    """
+    if not tiers:
+        # No pricing configured — fall back to "team will follow up"
+        return (
+            '- Say: "Pricing depends on the container size and how long you need it. I can schedule a delivery and our team will follow up with the exact pricing before we drop it off."',
+            'When recommending a size, say: "I can schedule a delivery and our team will follow up with the exact pricing before we drop it off."',
+            'Say: "I\'ll get that swap scheduled and our team will confirm pricing."',
+            'Say: "No problem, you can keep it as long as you need. Our team will work out the details with you."',
+            7,
+        )
+
+    # Build a natural pricing reference for the agent
+    lines = ["- DUMPSTER PRICING (quote these directly when asked):"]
+    included_days = 7
+    daily_rate_example = ""
+    for t in sorted(tiers, key=lambda x: x.get("sizeCuYd", 0)):
+        size = t.get("sizeCuYd", 0)
+        rate = t.get("baseRate", 0)
+        days = t.get("includedDays", 7)
+        daily = t.get("extendedDailyRate")
+        included_days = days
+        line = f"  {size}-yard: ${rate:.0f} for {days} days"
+        if daily:
+            line += f", then ${daily:.0f}/day after"
+            daily_rate_example = f"${daily:.0f} per extra day"
+        lines.append(line)
+
+    pricing_block = "\n".join(lines)
+
+    price_instruction = (
+        "When recommending a size, quote the price naturally. "
+        'For example: "A 20-yard is $375 for the first 7 days. That\'s our most popular size." '
+        "Use the pricing list above for exact numbers."
+    )
+
+    swap_price_instruction = (
+        'If they ask about the swap cost, refer to the base rate for their container size. '
+        'Say something like: "A swap for a [size]-yard is $[base rate]."'
+    )
+
+    extension_instruction = (
+        f'Say: "No problem at all — you can keep it as long as you need. '
+        f'It\'s just {daily_rate_example or "a daily rate"} after the first {included_days} days."'
+    ) if daily_rate_example else (
+        f'Say: "No problem, you can keep it past the {included_days} days. '
+        f'Our team will work out the daily rate with you."'
+    )
+
+    return pricing_block, price_instruction, swap_price_instruction, extension_instruction, included_days
 
 
 def _format_hour(hour: int) -> str:

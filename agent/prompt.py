@@ -158,7 +158,8 @@ def build_system_prompt(config: dict[str, Any]) -> str:
 
     # Dumpster pricing data (from dashboard config)
     dumpster_pricing = config.get("dumpsterPricing", [])
-    pricing_block, price_instruction, swap_price_instruction, extension_instruction, included_days = _format_dumpster_pricing(dumpster_pricing)
+    swap_fee = config.get("swapOutFee", 0)
+    pricing_block, price_instruction, swap_price_instruction, extension_instruction, included_days = _format_dumpster_pricing(dumpster_pricing, swap_fee)
 
     day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
     active_days = [day_names[d] for d in business_days if 0 <= d <= 6]
@@ -202,8 +203,12 @@ def build_system_prompt(config: dict[str, Any]) -> str:
     )
 
 
-def _format_dumpster_pricing(tiers: list[dict]) -> tuple[str, str, str, str, int]:
+def _format_dumpster_pricing(tiers: list[dict], swap_fee: float = 0) -> tuple[str, str, str, str, int]:
     """Format dumpster pricing tiers into prompt-friendly strings.
+
+    Args:
+        tiers: List of DumpsterPriceTier dicts from the dashboard config.
+        swap_fee: Flat swap fee from DumpsterSurcharge (type: swap). 0 = not configured.
 
     Returns: (pricing_block, price_instruction, swap_price_instruction, extension_instruction, included_days)
     """
@@ -233,6 +238,10 @@ def _format_dumpster_pricing(tiers: list[dict]) -> tuple[str, str, str, str, int
             daily_rate_example = f"${daily:.0f} per extra day"
         lines.append(line)
 
+    # Add swap fee to pricing block
+    if swap_fee and swap_fee > 0:
+        lines.append(f"  Swap-out fee: ${swap_fee:.0f} flat (same regardless of container size)")
+
     pricing_block = "\n".join(lines)
 
     price_instruction = (
@@ -241,10 +250,16 @@ def _format_dumpster_pricing(tiers: list[dict]) -> tuple[str, str, str, str, int
         "Use the pricing list above for exact numbers."
     )
 
-    swap_price_instruction = (
-        'If they ask about the swap cost, refer to the base rate for their container size. '
-        'Say something like: "A swap for a [size]-yard is $[base rate]."'
-    )
+    # Swap pricing: flat fee, not per-size
+    if swap_fee and swap_fee > 0:
+        swap_price_instruction = (
+            f'A swap is a flat ${swap_fee:.0f} regardless of container size. '
+            f'Say something like: "A swap is ${swap_fee:.0f} — we\'ll pick up the full one and drop off an empty one."'
+        )
+    else:
+        swap_price_instruction = (
+            'Say: "I\'ll get that swap scheduled and our team will confirm the pricing."'
+        )
 
     extension_instruction = (
         f'Say: "No problem at all — you can keep it as long as you need. '

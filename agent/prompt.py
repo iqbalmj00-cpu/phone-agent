@@ -229,10 +229,15 @@ def _format_dumpster_pricing(tiers: list[dict], swap_fee: float = 0) -> tuple[st
     for t in sorted(tiers, key=lambda x: x.get("sizeCuYd", 0)):
         size = t.get("sizeCuYd", 0)
         rate = t.get("baseRate", 0)
+        rate_min = t.get("baseRateMin") or rate
+        rate_max = t.get("baseRateMax")
         days = t.get("includedDays", 7)
         daily = t.get("extendedDailyRate")
         included_days = days
-        line = f"  {size}-yard: ${rate:.0f} for {days} days"
+        if rate_max and rate_max > rate_min:
+            line = f"  {size}-yard: ${rate_min:.0f} – ${rate_max:.0f} for {days} days"
+        else:
+            line = f"  {size}-yard: starting at ${rate_min:.0f} for {days} days"
         if daily:
             line += f", then ${daily:.0f}/day after"
             daily_rate_example = f"${daily:.0f} per extra day"
@@ -245,8 +250,8 @@ def _format_dumpster_pricing(tiers: list[dict], swap_fee: float = 0) -> tuple[st
     pricing_block = "\n".join(lines)
 
     price_instruction = (
-        "When recommending a size, quote the price naturally. "
-        'For example: "A 20-yard is $375 for the first 7 days. That\'s our most popular size." '
+        "When recommending a size, quote the price range naturally. "
+        'For example: "A 20-yard runs $375 to $650 for the first 7 days — the exact price depends on what you\'re tossing in there." '
         "Use the pricing list above for exact numbers."
     )
 

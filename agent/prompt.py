@@ -124,6 +124,9 @@ DUMPSTER RENTAL FLOW:
   8. AFTER REQUEST SUBMITTED (not auto-booked):
      - Say: "Your request has been submitted! Our team will follow up to confirm availability and pricing. Is there anything else I can help with?"
 
+  PRICING REFERENCE (use as fallback if availability check fails, or for general pricing questions):
+  {dumpster_price_instruction}
+
 DUMPSTER SWAP FLOW:
 - If caller says their dumpster is FULL and needs it SWAPPED (picked up and replaced with an empty one):
   1. Confirm the address where the dumpster is.
@@ -142,7 +145,7 @@ DUMPSTER EXTENDED RENTAL:
 """
 
 DUMPSTER_SCENARIOS = """- Dumpster rental inquiry: Ask about their project, suggest appropriate size, then call check_container_availability to get live pricing and availability. Follow the dumpster rental flow.
-- Dumpster pricing question: Call check_container_availability for the size they're asking about. If they haven't said a size, ask about their project first, recommend a size, then check availability to get the price.
+- Dumpster pricing question: Call check_container_availability for the size they're asking about. If they haven't said a size, ask about their project first, recommend a size, then check availability to get the price. If the availability check fails, use the pricing reference in the dumpster rental flow to quote prices directly.
 - Dumpster swap: Customer has a full dumpster that needs to be swapped. Follow the dumpster swap flow — collect address, date, time, confirm, and book with type "dumpster_swap".
 - Dumpster pickup only: If they just want the container picked up (no replacement), say: "I can schedule a final pickup for you!" and book as a dumpster_swap with a note that it's pickup-only.
 """
@@ -192,6 +195,7 @@ def build_system_prompt(config: dict[str, Any]) -> str:
     if dumpster_enabled:
         dumpster_info = DUMPSTER_COMPANY_INFO.format(dumpster_pricing_block=pricing_block)
         dumpster_flow = DUMPSTER_BOOKING_FLOW.format(
+            dumpster_price_instruction=price_instruction,
             dumpster_swap_price_instruction=swap_price_instruction,
             dumpster_extension_instruction=extension_instruction,
             included_days=included_days,

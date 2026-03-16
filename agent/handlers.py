@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 from pipecat.services.llm_service import FunctionCallParams
 
-from config import DASHBOARD_URL, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+from config import DASHBOARD_URL, INGEST_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
 
 # ── Per-call context — keyed by call_sid for concurrency safety ──
 _call_contexts: dict[str, dict[str, Any]] = {}
@@ -89,6 +89,15 @@ def _agent_headers(config: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _ingest_headers(config: dict[str, Any]) -> dict[str, str]:
+    """Build auth headers for ingest-style endpoints (container-availability).
+    Uses x-api-key + x-site-token — matches dashboard's validate-ingest.ts."""
+    return {
+        "x-api-key": INGEST_API_KEY,
+        "x-site-token": config.get("siteToken", ""),
+    }
+
+
 # ── Time Slots (must match website wizardData.ts) ───────
 
 TIME_SLOTS = {
@@ -129,6 +138,80 @@ def _is_business_hours(date: datetime, hour: int, config: dict) -> bool:
 
 
 # ── Tool Handlers ───────────────────────────────────────
+
+async def handle_check_container_availability(params: FunctionCallParams):
+    """Check real-time container availability via dashboard's
+    /api/booking/container-availability endpoint.
+
+    Auth: x-api-key + x-site-token (ingest-style auth).
+
+    Available response:  { available: true, count, baseRate, includedDays, extendedDailyRate, ... }
+    Unavailable response: { available: false, alternativeSizes: [10, 30, 40] }
+    """
+    config = _get_config()
+    size = params.arguments["size"]
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            resp = await http.get(
+                f"{DASHBOARD_URL}/api/booking/container-availability",
+                params={"size": size},
+                headers=_ingest_headers(config),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("available"):
+                    base_rate = data.get("baseRate")
+                    included_days = data.get("includedDays", 7)
+                    extended_rate = data.get("extendedDailyRate")
+
+                    price_msg = ""
+                    if base_rate:
+                        price_msg = f"${base_rate:.0f} for {included_days} days"
+                        if extended_rate:
+                            price_msg += f", then ${extended_rate:.0f}/day after"
+
+                    await params.result_callback({
+                        "available": True,
+                        "size": size,
+                        "baseRate": base_rate,
+                        "includedDays": included_days,
+                        "extendedDailyRate": extended_rate,
+                        "message": f"{size}-yard container is available. {price_msg}" if price_msg else f"{size}-yard container is available.",
+                    })
+                else:
+                    alternatives = data.get("alternativeSizes", [])
+                    if alternatives:
+                        alt_str = ", ".join(f"{s}-yard" for s in alternatives)
+                        await params.result_callback({
+                            "available": False,
+                            "alternativeSizes": alternatives,
+                            "message": f"No {size}-yard containers available right now. Alternative sizes available: {alt_str}.",
+                        })
+                    else:
+                        await params.result_callback({
+                            "available": False,
+                            "alternativeSizes": [],
+                            "message": f"No {size}-yard containers available, and no other sizes in stock right now. Offer to submit a request.",
+                        })
+            else:
+                # API error — fall back to static pricing from config
+                logger.warning(f"Container availability check returned {resp.status}")
+                await params.result_callback({
+                    "available": True,
+                    "message": f"I wasn't able to check live inventory, but let's go ahead and get you booked for a {size}-yard. Our team will confirm availability.",
+                    "fallback": True,
+                })
+    except Exception as e:
+        logger.error(f"Container availability check failed: {e}")
+        await params.result_callback({
+            "available": True,
+            "message": f"I'm having trouble checking availability right now, but let's go ahead and get you scheduled. Our team will follow up to confirm.",
+            "fallback": True,
+        })
+
 
 async def handle_check_availability(params: FunctionCallParams):
     """Check day-level capacity via dashboard's /api/agent/capacity-check.
@@ -286,18 +369,29 @@ async def handle_create_booking(params: FunctionCallParams):
                 if ctx.get("call_sid"):
                     mark_booking_complete(ctx["call_sid"])
 
+                auto_booked = data.get("autoBooked", False)
+
                 if is_swap:
                     await params.result_callback({
                         "success": True,
                         "booking_id": str(job_id),
                         "message": f"Dumpster swap scheduled for {date}, {slot['period']} window. We'll pick up the full container and drop off an empty one.",
                     })
+                elif is_dumpster and auto_booked:
+                    size_label = f"{container_size}-yard" if container_size else ""
+                    await params.result_callback({
+                        "success": True,
+                        "autoBooked": True,
+                        "booking_id": str(job_id),
+                        "message": f"Dumpster rental CONFIRMED for {date}. {size_label} container, {rental_duration_days} day rental. Delivery is scheduled. Customer will receive a confirmation text and email with a link to their customer portal to add a card on file before delivery.",
+                    })
                 elif is_dumpster:
                     size_label = f"{container_size}-yard" if container_size else ""
                     await params.result_callback({
                         "success": True,
+                        "autoBooked": False,
                         "booking_id": str(job_id),
-                        "message": f"Dumpster rental request submitted for {date}. {size_label} container, {rental_duration_days} day rental. Our team will follow up with exact pricing.",
+                        "message": f"Dumpster rental request submitted for {date}. {size_label} container, {rental_duration_days} day rental. Our team will follow up to confirm availability and pricing.",
                     })
                 else:
                     await params.result_callback({

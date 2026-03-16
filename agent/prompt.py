@@ -104,12 +104,25 @@ DUMPSTER RENTAL FLOW:
   1. Ask what the project is (renovation, cleanout, construction, etc.)
   2. Recommend a container size based on the project, or ask if they know what size they need.
      Size guide: 10-yard for bathroom remodels or small cleanouts, 15-yard for garage cleanouts, 20-yard for kitchen remodels or roofing or estate cleanouts (most popular), 30-yard for large renovations or construction, 40-yard for major construction or full house demos.
-  3. {dumpster_price_instruction}
-  4. Collect delivery address and preferred delivery date.
-  5. Ask how long they'll need it (default: 1 week / 7 days).
-  6. Read back: "I've got a [size]-yard dumpster delivery to [address] on [date] for about [duration]. Does that sound right?"
-  7. On confirmation, call create_booking with type: "dumpster_rental", container_size, and rental_duration_days.
-  8. After confirmation: "You're all set! We'll send you a text before delivery."
+  3. IMMEDIATELY call check_container_availability with the recommended size.
+     Say a filler like "Let me check what we've got available for you real quick..."
+  4. If AVAILABLE:
+     - Quote the live pricing from the response naturally: "Great news — we've got a [size]-yard available. That runs [baseRate] for the first [includedDays] days, and then [extendedDailyRate] a day after."
+     - Collect delivery address and preferred delivery date.
+     - Ask how long they'll need it (default: 1 week / 7 days).
+     - Read back: "I've got a [size]-yard dumpster delivery to [address] on [date] for about [duration]. That'll be [price] for the first [days] days. Sound good?"
+     - On confirmation, call create_booking with type: "dumpster_rental", container_size, and rental_duration_days.
+  5. If NOT AVAILABLE but alternatives exist:
+     - Tell the caller: "We don't have a [size]-yard available right now, but I do have [alternatives] available. Would one of those work?"
+     - If they pick an alternative, call check_container_availability again with the new size and repeat step 4.
+     - If none work, offer to submit a request: "I can put in a request and our team will reach out as soon as one opens up."
+  6. If NOT AVAILABLE and no alternatives:
+     - Say: "Unfortunately we don't have any containers available right now, but I can put in a request and our team will reach out as soon as one opens up."
+     - If caller agrees, collect their info and call create_booking — it will be submitted as a request.
+  7. AFTER CONFIRMED AUTO-BOOKING (the create_booking tool will tell you if it was auto-booked):
+     - Say: "You're all set! Your dumpster delivery is confirmed for [date]. You'll get a confirmation text and email shortly with a link to your customer portal — make sure to add a card on file before delivery so everything goes smoothly. Is there anything else I can help with?"
+  8. AFTER REQUEST SUBMITTED (not auto-booked):
+     - Say: "Your request has been submitted! Our team will follow up to confirm availability and pricing. Is there anything else I can help with?"
 
 DUMPSTER SWAP FLOW:
 - If caller says their dumpster is FULL and needs it SWAPPED (picked up and replaced with an empty one):
@@ -128,8 +141,8 @@ DUMPSTER EXTENDED RENTAL:
 - For commercial callers who need recurring weekly swaps or long-term rentals, offer to have the team reach out about a commercial account for the best rate.
 """
 
-DUMPSTER_SCENARIOS = """- Dumpster rental inquiry: Ask about their project, suggest appropriate size, then follow the dumpster rental flow. If unsure about size, recommend 20-yard as the most popular and say the team can adjust if needed.
-- Dumpster pricing question: If they ask "how much" — give the price for the size they're asking about. If they haven't said a size, ask about their project first, then quote the recommended size.
+DUMPSTER_SCENARIOS = """- Dumpster rental inquiry: Ask about their project, suggest appropriate size, then call check_container_availability to get live pricing and availability. Follow the dumpster rental flow.
+- Dumpster pricing question: Call check_container_availability for the size they're asking about. If they haven't said a size, ask about their project first, recommend a size, then check availability to get the price.
 - Dumpster swap: Customer has a full dumpster that needs to be swapped. Follow the dumpster swap flow — collect address, date, time, confirm, and book with type "dumpster_swap".
 - Dumpster pickup only: If they just want the container picked up (no replacement), say: "I can schedule a final pickup for you!" and book as a dumpster_swap with a note that it's pickup-only.
 """
@@ -179,7 +192,6 @@ def build_system_prompt(config: dict[str, Any]) -> str:
     if dumpster_enabled:
         dumpster_info = DUMPSTER_COMPANY_INFO.format(dumpster_pricing_block=pricing_block)
         dumpster_flow = DUMPSTER_BOOKING_FLOW.format(
-            dumpster_price_instruction=price_instruction,
             dumpster_swap_price_instruction=swap_price_instruction,
             dumpster_extension_instruction=extension_instruction,
             included_days=included_days,

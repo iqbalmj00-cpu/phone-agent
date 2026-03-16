@@ -58,6 +58,7 @@ from config import (
 from agent.prompt import build_system_prompt
 from agent.handlers import (
     handle_create_booking,
+    handle_check_container_availability,
     handle_lookup_appointment,
     handle_reschedule_appointment,
     handle_cancel_appointment,
@@ -89,6 +90,15 @@ tools = ToolsSchema(standard_tools=[
             "rental_duration_days": {"type": "integer", "description": "Rental duration in days, default 7 (only for dumpster_rental)"},
         },
         required=["name", "phone", "address", "date", "time", "description", "type"],
+    ),
+    FunctionSchema(
+        name="check_container_availability",
+        description="Check if a dumpster container of the requested size is currently available and get live pricing. Call this BEFORE create_booking for dumpster rentals to get real-time availability and pricing.",
+        properties={
+            "size": {"type": "string", "enum": ["10", "15", "20", "30", "40"],
+                     "description": "Container size in cubic yards"},
+        },
+        required=["size"],
     ),
     FunctionSchema(
         name="lookup_appointment",
@@ -223,6 +233,9 @@ async def run_bot(
 
     llm.register_function(
         "create_booking", handle_create_booking, cancel_on_interruption=False
+    )
+    llm.register_function(
+        "check_container_availability", handle_check_container_availability
     )
     llm.register_function("lookup_appointment", handle_lookup_appointment)
     llm.register_function(

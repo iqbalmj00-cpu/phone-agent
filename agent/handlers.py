@@ -458,8 +458,7 @@ async def handle_lookup_appointment(params: FunctionCallParams):
 async def handle_reschedule_appointment(params: FunctionCallParams):
     """Reschedule an appointment.
 
-    NOTE: Dashboard endpoint /api/agent/reschedule needs to be built by developer.
-    Expected: POST /api/agent/reschedule { phone, newDate, timeSlot } with X-AGENT-SECRET auth
+    Dashboard: POST /api/agent/reschedule { phone, newDate, newTime } with X-AGENT-SECRET auth
     """
     config = _get_config()
     phone = params.arguments["phone"]
@@ -491,7 +490,7 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
                 json={
                     "phone": phone,
                     "newDate": new_date,
-                    "timeSlot": slot["period"],
+                    "newTime": slot["start"],
                 },
                 headers=_agent_headers(config),
                 timeout=aiohttp.ClientTimeout(total=10),
@@ -513,8 +512,7 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
 async def handle_cancel_appointment(params: FunctionCallParams):
     """Cancel an appointment.
 
-    NOTE: Dashboard endpoint /api/agent/cancel needs to be built by developer.
-    Expected: POST /api/agent/cancel { phone, reason } with X-AGENT-SECRET auth
+    Dashboard: POST /api/agent/cancel { phone, reason } with X-AGENT-SECRET auth
     """
     config = _get_config()
     ctx = _get_context()

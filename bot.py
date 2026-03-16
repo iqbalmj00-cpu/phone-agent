@@ -93,10 +93,14 @@ tools = ToolsSchema(standard_tools=[
     ),
     FunctionSchema(
         name="check_container_availability",
-        description="Check if a dumpster container of the requested size is currently available and get live pricing. Call this BEFORE create_booking for dumpster rentals to get real-time availability and pricing.",
+        description="Check if a dumpster container of the requested size is available for a specific delivery date and get live pricing. Call this AFTER collecting the customer's preferred delivery date and rental duration.",
         properties={
             "size": {"type": "string", "enum": ["10", "15", "20", "30", "40"],
                      "description": "Container size in cubic yards"},
+            "date": {"type": "string",
+                     "description": "Requested delivery date in YYYY-MM-DD format"},
+            "days": {"type": "integer",
+                     "description": "Rental duration in days (default 7)"},
         },
         required=["size"],
     ),

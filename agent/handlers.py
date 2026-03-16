@@ -150,12 +150,19 @@ async def handle_check_container_availability(params: FunctionCallParams):
     """
     config = _get_config()
     size = params.arguments["size"]
+    date = params.arguments.get("date")
+    days = params.arguments.get("days")
 
     try:
         async with aiohttp.ClientSession() as http:
+            query: dict[str, str] = {"size": size}
+            if date:
+                query["date"] = date
+            if days:
+                query["days"] = str(days)
             resp = await http.get(
                 f"{DASHBOARD_URL}/api/booking/container-availability",
-                params={"size": size},
+                params=query,
                 headers=_ingest_headers(config),
                 timeout=aiohttp.ClientTimeout(total=10),
             )
@@ -183,18 +190,44 @@ async def handle_check_container_availability(params: FunctionCallParams):
                     })
                 else:
                     alternatives = data.get("alternativeSizes", [])
+                    next_date = data.get("nextAvailableDate")
+                    if next_date:
+                        # Parse ISO date to readable format
+                        try:
+                            from datetime import datetime as _dt
+                            nd = _dt.fromisoformat(next_date.replace("Z", "+00:00"))
+                            next_date_str = nd.strftime("%A, %B %d")
+                        except Exception:
+                            next_date_str = next_date
+                    else:
+                        next_date_str = None
+
                     if alternatives:
                         alt_str = ", ".join(f"{s}-yard" for s in alternatives)
+                        msg = f"No {size}-yard containers available"
+                        if next_date_str:
+                            msg += f" for that date. Next available: {next_date_str}."
+                        else:
+                            msg += " right now."
+                        msg += f" Alternative sizes available: {alt_str}."
                         await params.result_callback({
                             "available": False,
                             "alternativeSizes": alternatives,
-                            "message": f"No {size}-yard containers available right now. Alternative sizes available: {alt_str}.",
+                            "nextAvailableDate": next_date,
+                            "message": msg,
                         })
                     else:
+                        msg = f"No {size}-yard containers available"
+                        if next_date_str:
+                            msg += f" for that date. Next available: {next_date_str}."
+                        else:
+                            msg += ", and no other sizes in stock right now."
+                        msg += " Offer to submit a request."
                         await params.result_callback({
                             "available": False,
                             "alternativeSizes": [],
-                            "message": f"No {size}-yard containers available, and no other sizes in stock right now. Offer to submit a request.",
+                            "nextAvailableDate": next_date,
+                            "message": msg,
                         })
             else:
                 # API error — fall back to static pricing from config

@@ -414,11 +414,10 @@ async def handle_create_booking(params: FunctionCallParams):
 
 
 async def handle_lookup_appointment(params: FunctionCallParams):
-    """Look up an existing appointment by phone number.
+    """Look up existing appointments by phone number.
 
-    NOTE: Dashboard endpoint /api/agent/lookup needs to be built by developer.
-    Expected: GET /api/agent/lookup?phone=XXX with X-AGENT-SECRET auth
-    Expected response: { found: bool, appointment?: { id, date, address, status } }
+    Dashboard: GET /api/agent/lookup?phone=XXX with X-AGENT-SECRET auth
+    Response: { found: bool, customer?: { id, name, phone }, jobs?: [{ jobId, title, address, scheduledDate, timeSlot, status }] }
     """
     config = _get_config()
     phone = params.arguments["phone"]
@@ -437,7 +436,8 @@ async def handle_lookup_appointment(params: FunctionCallParams):
                 if data.get("found"):
                     await params.result_callback({
                         "found": True,
-                        "booking": data.get("appointment", {}),
+                        "customer": data.get("customer", {}),
+                        "jobs": data.get("jobs", []),
                     })
                 else:
                     await params.result_callback({

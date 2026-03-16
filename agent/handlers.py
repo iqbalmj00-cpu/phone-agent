@@ -174,11 +174,15 @@ async def handle_check_container_availability(params: FunctionCallParams):
                     included_days = data.get("includedDays", 7)
                     extended_rate = data.get("extendedDailyRate")
 
+                    # Round to nearest $5 for clean customer-facing prices
+                    def _round5(n: float) -> int:
+                        return round(n / 5) * 5
+
                     price_msg = ""
                     if base_rate:
-                        price_msg = f"${base_rate:.0f} for {included_days} days"
+                        price_msg = f"${_round5(base_rate)} for {included_days} days"
                         if extended_rate:
-                            price_msg += f", then ${extended_rate:.0f}/day after"
+                            price_msg += f", then ${_round5(extended_rate)}/day after"
 
                     await params.result_callback({
                         "available": True,

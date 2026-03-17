@@ -63,6 +63,7 @@ from agent.handlers import (
     handle_reschedule_appointment,
     handle_cancel_appointment,
     handle_transfer_to_human,
+    handle_validate_promo_code,
     set_call_context,
     set_pipeline_task,
     clear_call_context,
@@ -88,6 +89,7 @@ tools = ToolsSchema(standard_tools=[
             "type": {"type": "string", "enum": ["pickup", "in_person_estimate", "dumpster_rental", "dumpster_swap"], "description": "Type of appointment. Use 'dumpster_rental' for new deliveries, 'dumpster_swap' for swapping a full container for an empty one."},
             "container_size": {"type": "string", "enum": ["10", "15", "20", "30", "40"], "description": "Container size in cubic yards (for dumpster_rental or dumpster_swap)"},
             "rental_duration_days": {"type": "integer", "description": "Rental duration in days, default 7 (only for dumpster_rental)"},
+            "promo_code": {"type": "string", "description": "Validated promo code to apply discount (optional)"},
         },
         required=["name", "phone", "address", "date", "time", "description", "type"],
     ),
@@ -138,6 +140,14 @@ tools = ToolsSchema(standard_tools=[
             "reason": {"type": "string", "description": "Why the caller wants to be transferred"},
         },
         required=["reason"],
+    ),
+    FunctionSchema(
+        name="validate_promo_code",
+        description="Validate a promo or referral code. Call when the caller mentions having a discount code.",
+        properties={
+            "code": {"type": "string", "description": "The promo code to validate"},
+        },
+        required=["code"],
     ),
 ])
 
@@ -251,6 +261,7 @@ async def run_bot(
     llm.register_function(
         "transfer_to_human", handle_transfer_to_human, cancel_on_interruption=False
     )
+    llm.register_function("validate_promo_code", handle_validate_promo_code)
 
     # ── Pipeline ────────────────────────────────────────
     sentence_aggregator = SentenceAggregator()

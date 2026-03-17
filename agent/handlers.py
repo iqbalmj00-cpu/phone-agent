@@ -11,6 +11,7 @@ ENDPOINT MAPPING (dashboard ↔ phone agent):
   - reschedule            → POST /api/agent/reschedule        (X-AGENT-SECRET auth)
   - cancel                → POST /api/agent/cancel            (X-AGENT-SECRET auth)
   - transfer_to_human     → Twilio REST API (call redirect)
+  - validate_promo_code   → GET  /api/promo/validate          (x-api-key + x-site-token)
 """
 
 import asyncio
@@ -250,6 +251,66 @@ async def handle_check_container_availability(params: FunctionCallParams):
         })
 
 
+async def handle_validate_promo_code(params: FunctionCallParams):
+    """Validate a promo/referral code via dashboard's /api/promo/validate.
+
+    Dashboard returns: { valid: bool, discountType?: str, discountValue?: float }
+    Auth: x-api-key + x-site-token (ingest-style)
+    """
+    config = _get_config()
+    code = params.arguments.get("code", "").strip()
+
+    if not code:
+        await params.result_callback({
+            "valid": False,
+            "message": "No code provided.",
+        })
+        return
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            resp = await http.get(
+                f"{DASHBOARD_URL}/api/promo/validate",
+                params={"code": code},
+                headers=_ingest_headers(config),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+            data = await resp.json()
+
+            if data.get("valid"):
+                discount_type = data.get("discountType", "percentage")
+                discount_value = data.get("discountValue", 0)
+                if discount_type == "percentage":
+                    msg = f"Code {code.upper()} is valid — {discount_value}% discount. Include this code when booking."
+                else:
+                    msg = f"Code {code.upper()} is valid — ${discount_value:.0f} off. Include this code when booking."
+                await params.result_callback({
+                    "valid": True,
+                    "code": code.upper(),
+                    "discountType": discount_type,
+                    "discountValue": discount_value,
+                    "message": msg,
+                })
+            else:
+                reason = data.get("reason", "invalid")
+                reason_msg = {
+                    "not_found": "That code doesn't exist.",
+                    "expired": "That code has expired.",
+                    "inactive": "That code is no longer active.",
+                    "max_uses_reached": "That code has been fully redeemed.",
+                }.get(reason, "That code isn't valid.")
+                await params.result_callback({
+                    "valid": False,
+                    "message": reason_msg,
+                })
+    except Exception as e:
+        logger.error(f"Promo code validation failed: {e}")
+        await params.result_callback({
+            "valid": False,
+            "message": "I'm having trouble checking that code right now. Let's go ahead and book without it — you can always apply it later.",
+        })
+
+
 async def handle_check_availability(params: FunctionCallParams):
     """Check day-level capacity via dashboard's /api/agent/capacity-check.
 
@@ -385,6 +446,10 @@ async def handle_create_booking(params: FunctionCallParams):
     if is_dumpster:
         payload["containerSize"] = container_size
         payload["rentalDays"] = rental_duration_days
+
+    promo_code = params.arguments.get("promo_code")
+    if promo_code:
+        payload["promoCode"] = promo_code
 
     try:
         async with aiohttp.ClientSession() as http:

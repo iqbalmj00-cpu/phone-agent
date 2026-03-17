@@ -80,6 +80,7 @@ SCENARIOS:
 - Complaint or escalation: empathize first, then offer to transfer: "I'm really sorry to hear that. Let me connect you with someone from our team who can help." Then use transfer_to_human.
 - Off-topic / spam: politely redirect: "I appreciate you calling! Is there anything I can help you with regarding junk removal?"
 {dumpster_scenarios}
+{promo_section}
 HUMAN HANDOFF:
 - If the caller explicitly asks to speak to a real person, manager, or human — use transfer_to_human immediately. Do NOT try to handle it yourself.
 - If the caller has a complaint, damage claim, billing dispute, or legal question — offer to transfer.
@@ -89,6 +90,15 @@ HUMAN HANDOFF:
 - If the transfer fails, say: "I wasn't able to connect you right now, but I've noted your request. Someone from our team will call you back shortly."
 """
 
+
+PROMO_SECTION = """
+PROMO CODES:
+- If the caller mentions a promo code, referral code, or discount code, ask them for it.
+- Call validate_promo_code with the code before finalizing the booking.
+- If valid: tell them their discount, then include the promo_code parameter when calling create_booking.
+- If invalid or expired: let them know politely and proceed without discount.
+- Do NOT proactively ask about promo codes — only respond if the caller brings it up.
+"""
 
 # ── Dumpster rental prompt sections (conditionally injected) ──
 
@@ -221,6 +231,7 @@ def build_system_prompt(config: dict[str, Any]) -> str:
         dumpster_company_info=dumpster_info,
         dumpster_booking_flow=dumpster_flow,
         dumpster_scenarios=dumpster_scen,
+        promo_section=PROMO_SECTION,
     )
 
 

@@ -119,8 +119,36 @@ def _validate_date(date_str: str) -> datetime | None:
 
 
 def _validate_time_slot(slot_id: str) -> dict | None:
-    """Validate a time slot ID and return the slot definition, or None."""
-    return TIME_SLOTS.get(slot_id.lower().strip()) if slot_id else None
+    """Validate a time slot ID and return the slot definition, or None.
+
+    Accepts both old-style IDs (morning, midday, etc.) and new dynamic
+    time-range format from check_available_slots (e.g. '08:00-10:00').
+    """
+    if not slot_id:
+        return None
+    # Old named slots
+    old = TIME_SLOTS.get(slot_id.lower().strip())
+    if old:
+        return old
+    # New dynamic format: "HH:MM-HH:MM"
+    stripped = slot_id.strip()
+    if "-" in stripped:
+        parts = stripped.split("-")
+        if len(parts) == 2:
+            try:
+                sh, sm = parts[0].split(":")
+                eh, em = parts[1].split(":")
+                start_hour = int(sh)
+                return {
+                    "label": f"{parts[0]} - {parts[1]}",
+                    "start": parts[0],
+                    "end": parts[1],
+                    "start_hour": start_hour,
+                    "period": stripped,  # Use the range as the period
+                }
+            except (ValueError, IndexError):
+                pass
+    return None
 
 
 def _is_business_hours(date: datetime, hour: int, config: dict) -> bool:
@@ -372,6 +400,88 @@ async def handle_check_availability(params: FunctionCallParams):
         })
 
 
+async def handle_check_available_slots(params: FunctionCallParams):
+    """Check available time slots for a specific date.
+
+    Calls GET /api/public/available-slots?date=YYYY-MM-DD
+    Returns human-readable list of available/full time windows.
+    """
+    config = _get_config()
+    date = params.arguments["date"]
+
+    parsed_date = _validate_date(date)
+    if not parsed_date:
+        await params.result_callback({
+            "error": "I need the date in YYYY-MM-DD format. Please resolve relative dates first."
+        })
+        return
+
+    # Business day check
+    business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
+    js_day = (parsed_date.weekday() + 1) % 7
+    if js_day not in business_days:
+        await params.result_callback({
+            "available": False,
+            "slots": [],
+            "message": "We're closed that day. Ask which weekday works best."
+        })
+        return
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            resp = await http.get(
+                f"{DASHBOARD_URL}/api/public/available-slots",
+                params={"date": date},
+                headers=_ingest_headers(config),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+            if resp.status == 200:
+                data = await resp.json()
+                slots = data.get("slots", [])
+                available = [s for s in slots if s.get("available")]
+                full = [s for s in slots if not s.get("available")]
+
+                # Format human-readable times
+                def fmt_time(t: str) -> str:
+                    """Convert '08:00' to '8 AM', '14:00' to '2 PM'."""
+                    try:
+                        h = int(t.split(":")[0])
+                        if h == 0: return "12 AM"
+                        if h == 12: return "12 PM"
+                        return f"{h} AM" if h < 12 else f"{h - 12} PM"
+                    except (ValueError, IndexError):
+                        return t
+
+                if available:
+                    time_strs = [f"{fmt_time(s['start'])} to {fmt_time(s['end'])}" for s in available]
+                    msg = f"Available times on {date}: {', '.join(time_strs)}."
+                    if full:
+                        full_strs = [f"{fmt_time(s['start'])} to {fmt_time(s['end'])}" for s in full]
+                        msg += f" Fully booked: {', '.join(full_strs)}."
+                else:
+                    msg = f"All time slots are fully booked on {date}. Suggest a different date."
+
+                await params.result_callback({
+                    "available": len(available) > 0,
+                    "slots": [{"start": s["start"], "end": s["end"], "label": s.get("label", ""), "available": s["available"]} for s in slots],
+                    "message": msg,
+                })
+            else:
+                # API error — fall back to offering any time
+                await params.result_callback({
+                    "available": True,
+                    "slots": [],
+                    "message": "I couldn't check slot availability. Go ahead and offer their preferred time."
+                })
+    except Exception as e:
+        logger.error(f"Available slots check failed: {e}")
+        await params.result_callback({
+            "available": True,
+            "slots": [],
+            "message": "I couldn't check the schedule right now. Go ahead and offer their preferred time."
+        })
+
+
 async def handle_create_booking(params: FunctionCallParams):
     """Create a booking via dashboard's /api/agent/book.
 
@@ -403,7 +513,7 @@ async def handle_create_booking(params: FunctionCallParams):
     slot = _validate_time_slot(time_slot_id)
     if not slot:
         await params.result_callback({
-            "error": "Please use a valid time window: morning, midday, afternoon, or late."
+            "error": "I need a valid time. Check available slots first with check_available_slots, or use: morning, midday, afternoon, or late."
         })
         return
 
@@ -438,7 +548,7 @@ async def handle_create_booking(params: FunctionCallParams):
         "customerPhone": phone,
         "address": address,
         "date": f"{date}T{slot['start']}:00{tz_offset_formatted}",
-        "timeSlot": slot["period"],
+        "timeSlot": slot["period"],  # "08:00-10:00" or "Morning"
         "notes": notes,
         "type": booking_type,
         "serviceType": "dumpster_rental" if is_dumpster else "junk_removal",
@@ -500,6 +610,38 @@ async def handle_create_booking(params: FunctionCallParams):
                         "success": True,
                         "booking_id": str(job_id),
                         "message": f"Booking confirmed for {date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
+                    })
+            elif resp.status == 409:
+                # slot_full — the time slot filled between checking and booking
+                data = await resp.json()
+                available_slots = data.get("availableSlots", [])
+                if available_slots:
+                    def fmt_t(t: str) -> str:
+                        try:
+                            h = int(t.split(":")[0])
+                            if h == 0: return "12 AM"
+                            if h == 12: return "12 PM"
+                            return f"{h} AM" if h < 12 else f"{h - 12} PM"
+                        except (ValueError, IndexError):
+                            return t
+                    avail = [s for s in available_slots if s.get("available")]
+                    if avail:
+                        alt_strs = [f"{fmt_t(s['start'])} to {fmt_t(s['end'])}" for s in avail[:4]]
+                        await params.result_callback({
+                            "error": "slot_full",
+                            "message": f"That time slot just filled up. Available alternatives: {', '.join(alt_strs)}. Ask the caller which works.",
+                            "availableSlots": avail,
+                        })
+                    else:
+                        await params.result_callback({
+                            "error": "slot_full",
+                            "message": f"That time slot and all others on {date} are now full. Suggest a different date.",
+                            "availableSlots": [],
+                        })
+                else:
+                    await params.result_callback({
+                        "error": "slot_full",
+                        "message": "That time slot just filled up. Ask the caller for a different time.",
                     })
             else:
                 text = await resp.text()

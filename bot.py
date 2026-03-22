@@ -59,6 +59,7 @@ from agent.prompt import build_system_prompt
 from agent.handlers import (
     handle_create_booking,
     handle_check_container_availability,
+    handle_check_available_slots,
     handle_lookup_appointment,
     handle_reschedule_appointment,
     handle_cancel_appointment,
@@ -84,7 +85,7 @@ tools = ToolsSchema(standard_tools=[
             "phone": {"type": "string", "description": "Customer phone number"},
             "address": {"type": "string", "description": "Service address"},
             "date": {"type": "string", "description": "YYYY-MM-DD"},
-            "time": {"type": "string", "description": "Time window slot ID: morning (8-10 AM), midday (10 AM-12 PM), afternoon (12-2 PM), or late (2-4 PM)"},
+            "time": {"type": "string", "description": "Time slot: use the start-end format from check_available_slots (e.g. '08:00-10:00'), or old labels: morning, midday, afternoon, late"},
             "description": {"type": "string", "description": "Items for removal, project description for dumpster, or swap reason"},
             "type": {"type": "string", "enum": ["pickup", "in_person_estimate", "dumpster_rental", "dumpster_swap"], "description": "Type of appointment. Use 'dumpster_rental' for new deliveries, 'dumpster_swap' for swapping a full container for an empty one."},
             "container_size": {"type": "string", "enum": ["10", "15", "20", "30", "40"], "description": "Container size in cubic yards (for dumpster_rental or dumpster_swap)"},
@@ -116,11 +117,11 @@ tools = ToolsSchema(standard_tools=[
     ),
     FunctionSchema(
         name="reschedule_appointment",
-        description="Reschedule an existing appointment. Read back new details and confirm first.",
+        description="Reschedule an existing appointment. Call check_available_slots first to find open times, then read back new details and confirm.",
         properties={
             "phone": {"type": "string", "description": "Customer phone to find booking"},
             "new_date": {"type": "string", "description": "YYYY-MM-DD"},
-            "new_time": {"type": "string", "description": "Time window slot ID: morning, midday, afternoon, or late"},
+            "new_time": {"type": "string", "description": "Time slot: use start-end format from check_available_slots (e.g. '08:00-10:00'), or old labels: morning, midday, afternoon, late"},
         },
         required=["phone", "new_date", "new_time"],
     ),
@@ -148,6 +149,14 @@ tools = ToolsSchema(standard_tools=[
             "code": {"type": "string", "description": "The promo code to validate"},
         },
         required=["code"],
+    ),
+    FunctionSchema(
+        name="check_available_slots",
+        description="Check which time slots are available for a specific date. Call this BEFORE offering times to the caller. Returns available and fully-booked time windows with capacity info.",
+        properties={
+            "date": {"type": "string", "description": "Date in YYYY-MM-DD format to check availability for"},
+        },
+        required=["date"],
     ),
 ])
 
@@ -262,6 +271,7 @@ async def run_bot(
         "transfer_to_human", handle_transfer_to_human, cancel_on_interruption=False
     )
     llm.register_function("validate_promo_code", handle_validate_promo_code)
+    llm.register_function("check_available_slots", handle_check_available_slots)
 
     # ── Pipeline ────────────────────────────────────────
     sentence_aggregator = SentenceAggregator()

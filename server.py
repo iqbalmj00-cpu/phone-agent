@@ -51,7 +51,7 @@ def _is_within_business_hours(config: dict) -> bool:
 
     biz_start = int(config.get("businessStart", 8))
     biz_end = int(config.get("businessEnd", 18))
-    biz_days = config.get("businessDays", [1, 2, 3, 4, 5])  # JS convention: 0=Sun
+    biz_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])  # JS convention: 0=Sun
 
     # Convert Python weekday (0=Mon) to JS convention (0=Sun)
     js_weekday = (now.weekday() + 1) % 7
@@ -70,6 +70,25 @@ def _format_hours_label(config: dict) -> str:
     start_label = f"{start} AM" if start < 12 else f"{start - 12} PM" if start > 12 else "12 PM"
     end_label = f"{end} AM" if end < 12 else f"{end - 12} PM" if end > 12 else "12 PM"
     return f"{start_label} to {end_label}"
+
+
+def _format_days_label(config: dict) -> str:
+    """Format business days for the voice message using actual config."""
+    day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    biz_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
+    if not biz_days:
+        return "Monday through Saturday"
+    active = [day_names[d] for d in sorted(biz_days) if 0 <= d <= 6]
+    if not active:
+        return "Monday through Saturday"
+    if len(active) == 1:
+        return active[0]
+    # Check if contiguous
+    sorted_days = sorted(biz_days)
+    is_contiguous = all(sorted_days[i+1] - sorted_days[i] == 1 for i in range(len(sorted_days)-1))
+    if is_contiguous:
+        return f"{active[0]} through {active[-1]}"
+    return ", ".join(active)
 
 
 @app.post("/twiml/{client_id}")
@@ -93,6 +112,7 @@ async def twiml_webhook(client_id: str, request: Request):
     if tier == "starter" and not _is_within_business_hours(config):
         company = config.get("companyName", "us")
         hours_label = _format_hours_label(config)
+        days_label = _format_days_label(config)
         logger.info(f"Starter after-hours call for {company} ({client_id}) — returning closed message")
 
         closed_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -100,13 +120,29 @@ async def twiml_webhook(client_id: str, request: Request):
     <Say voice="Polly.Joanna">
         Thanks for calling {company}.
         Our office is currently closed.
-        Our hours are {hours_label}, Monday through Friday.
+        Our hours are {days_label}, {hours_label}.
         Please call back during business hours,
         or visit our website to book a pickup online.
         Thank you, and have a great day!
     </Say>
 </Response>"""
         return PlainTextResponse(content=closed_twiml, media_type="application/xml")
+
+    # ── Concurrent call limit — voice message instead of silent drop ──
+    async with _calls_lock:
+        if len(_active_calls) >= MAX_CONCURRENT_CALLS:
+            company = config.get("companyName", "us")
+            logger.warning(f"Max concurrent calls ({MAX_CONCURRENT_CALLS}) reached at TwiML — returning busy message for {company}")
+            busy_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Joanna">
+        Thanks for calling {company}.
+        We're experiencing high call volume right now.
+        Please try again in a few minutes, or visit our website to book online.
+        Thank you!
+    </Say>
+</Response>"""
+            return PlainTextResponse(content=busy_twiml, media_type="application/xml")
 
     # ── Growth tier or within business hours: connect to AI agent ──
     host = request.headers.get("host", "localhost")

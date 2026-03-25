@@ -367,9 +367,10 @@ async def run_bot(
 
     async def _post_booking_watcher(task, context, cid: str):
         """After a booking completes, wait for the LLM to finish its natural
-        response, then start a 20s silence timer. If the caller speaks, the
-        timer resets. Only hang up after 20s of total silence."""
-        POST_BOOKING_SILENCE_SECONDS = 20
+        response, then start a silence timer. Nudge at 15s, hang up at 25s.
+        If the caller speaks, the timer resets."""
+        POST_BOOKING_SILENCE_SECONDS = 25
+        NUDGE_AFTER_SECONDS = 15
 
         try:
             # Phase 1: Wait for booking to complete
@@ -382,15 +383,26 @@ async def run_bot(
             # (the system prompt already instructs it to ask "anything else?")
             await asyncio.sleep(10)
 
-            # Reset speech timer so the 20s countdown starts fresh
+            # Reset speech timer so the countdown starts fresh
             nonlocal last_caller_speech_time
             last_caller_speech_time = datetime.now(ZoneInfo(timezone))
+            nudge_sent = False
 
-            # Phase 2: 20s silence timer with speech reset
+            # Phase 2: Silence timer with nudge and speech reset
             while True:
                 now = datetime.now(ZoneInfo(timezone))
                 elapsed = (now - last_caller_speech_time).total_seconds()
 
+                # At 15s: gentle nudge
+                if elapsed >= NUDGE_AFTER_SECONDS and not nudge_sent:
+                    context.messages.append({
+                        "role": "system",
+                        "content": "The caller has been quiet. Gently ask: 'Was there anything else you needed help with?'",
+                    })
+                    await task.queue_frames([LLMMessagesFrame(context.messages)])
+                    nudge_sent = True
+
+                # At 25s: say goodbye and hang up
                 if elapsed >= POST_BOOKING_SILENCE_SECONDS:
                     logger.info(f"Post-booking silence ({POST_BOOKING_SILENCE_SECONDS}s) — ending call {cid}")
 

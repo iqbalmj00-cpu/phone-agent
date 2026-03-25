@@ -5,7 +5,6 @@ Each handler receives a FunctionCallParams object and uses the client_config
 dashboard tenant.
 
 ENDPOINT MAPPING (dashboard ↔ phone agent):
-  - check_availability    → GET  /api/agent/capacity-check  (X-AGENT-SECRET auth)
   - create_booking        → POST /api/agent/book             (X-AGENT-SECRET auth)
   - lookup_appointment    → GET  /api/agent/lookup            (X-AGENT-SECRET auth)
   - reschedule            → POST /api/agent/reschedule        (X-AGENT-SECRET auth)
@@ -16,6 +15,7 @@ ENDPOINT MAPPING (dashboard ↔ phone agent):
 
 import asyncio
 import contextvars
+import json
 import aiohttp
 from datetime import datetime
 from typing import Any
@@ -72,10 +72,10 @@ def _get_context() -> dict[str, Any]:
     call_sid = _current_call_sid.get()
     if call_sid and call_sid in _call_contexts:
         return _call_contexts[call_sid]
-    # Fallback for single-call scenarios
-    if not _call_contexts:
-        return {}
-    return list(_call_contexts.values())[-1]
+    # No matching context — log and return empty
+    if _call_contexts:
+        logger.critical(f"No call context for call_sid={call_sid}. Active: {list(_call_contexts.keys())}")
+    return {}
 
 
 def _get_config() -> dict[str, Any]:
@@ -97,6 +97,17 @@ def _ingest_headers(config: dict[str, Any]) -> dict[str, str]:
         "x-api-key": INGEST_API_KEY,
         "x-site-token": config.get("siteToken", ""),
     }
+
+
+
+async def _safe_json(resp: aiohttp.ClientResponse, label: str) -> dict:
+    """Parse JSON safely, logging raw text on failure."""
+    text = await resp.text()
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        logger.error(f"[{label}] Non-JSON response (status {resp.status}): {text[:500]}")
+        return {"error": f"Dashboard returned non-JSON (status {resp.status})"}
 
 
 # ── Time Slots (must match website wizardData.ts) ───────
@@ -197,7 +208,7 @@ async def handle_check_container_availability(params: FunctionCallParams):
             )
 
             if resp.status == 200:
-                data = await resp.json()
+                data = await _safe_json(resp, "container-availability")
                 if data.get("available"):
                     base_rate = data.get("baseRate")
                     included_days = data.get("includedDays", 7)
@@ -303,7 +314,7 @@ async def handle_validate_promo_code(params: FunctionCallParams):
                 headers=_ingest_headers(config),
                 timeout=aiohttp.ClientTimeout(total=10),
             )
-            data = await resp.json()
+            data = await _safe_json(resp, "validate-promo")
 
             if data.get("valid"):
                 discount_type = data.get("discountType", "percentage")
@@ -339,65 +350,6 @@ async def handle_validate_promo_code(params: FunctionCallParams):
         })
 
 
-async def handle_check_availability(params: FunctionCallParams):
-    """Check day-level capacity via dashboard's /api/agent/capacity-check.
-
-    Dashboard returns: { hasCapacity: bool, date: str, availableTrucks?: int, reason?: str }
-    """
-    config = _get_config()
-    date = params.arguments["date"]
-    time_preference = params.arguments.get("time_preference", "any")
-
-    parsed_date = _validate_date(date)
-    if not parsed_date:
-        await params.result_callback({
-            "error": "I need the date in YYYY-MM-DD format. Please resolve relative dates first."
-        })
-        return
-
-    business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
-    js_day = (parsed_date.weekday() + 1) % 7
-    if js_day not in business_days:
-        await params.result_callback({
-            "available": False,
-            "message": "That day we're closed. Let me find a day that works.",
-            "suggestion": "Ask the caller which weekday works best."
-        })
-        return
-
-    # Call dashboard's capacity-check endpoint (uses X-AGENT-SECRET auth)
-    try:
-        async with aiohttp.ClientSession() as http:
-            resp = await http.get(
-                f"{DASHBOARD_URL}/api/agent/capacity-check",
-                params={"date": date, "volumeEstimate": "4"},
-                headers=_agent_headers(config),
-                timeout=aiohttp.ClientTimeout(total=10),
-            )
-            if resp.status == 200:
-                data = await resp.json()
-                if data.get("hasCapacity"):
-                    await params.result_callback({
-                        "available": True,
-                        "message": f"We have capacity on {date}. {data.get('availableTrucks', 'Multiple')} trucks available."
-                    })
-                else:
-                    await params.result_callback({
-                        "available": False,
-                        "message": f"No capacity on {date}. {data.get('reason', 'All trucks are full.')}",
-                    })
-            else:
-                # API error — default to "available" so we don't block bookings
-                await params.result_callback({
-                    "available": True,
-                    "message": "Schedule looks open, go ahead and book."
-                })
-    except Exception as e:
-        logger.error(f"Capacity check failed: {e}")
-        await params.result_callback({
-            "available": True,
-            "message": "I can't check the schedule right now, but let's go ahead and get you booked."
-        })
 
 
 async def handle_check_available_slots(params: FunctionCallParams):
@@ -436,7 +388,7 @@ async def handle_check_available_slots(params: FunctionCallParams):
                 timeout=aiohttp.ClientTimeout(total=10),
             )
             if resp.status == 200:
-                data = await resp.json()
+                data = await _safe_json(resp, "available-slots")
                 slots = data.get("slots", [])
                 available = [s for s in slots if s.get("available")]
                 full = [s for s in slots if not s.get("available")]
@@ -571,7 +523,7 @@ async def handle_create_booking(params: FunctionCallParams):
             )
 
             if resp.status == 201:
-                data = await resp.json()
+                data = await _safe_json(resp, "create-booking")
                 job_id = data.get("jobId", "confirmed")
                 label = "Dumpster rental" if is_dumpster else "Booking"
                 logger.info(f"{label} created: jobId={job_id} for {name} on {date} ({slot['period']} window)")
@@ -613,7 +565,7 @@ async def handle_create_booking(params: FunctionCallParams):
                     })
             elif resp.status == 409:
                 # slot_full — the time slot filled between checking and booking
-                data = await resp.json()
+                data = await _safe_json(resp, "create-booking-conflict")
                 available_slots = data.get("availableSlots", [])
                 if available_slots:
                     def fmt_t(t: str) -> str:
@@ -676,7 +628,7 @@ async def handle_lookup_appointment(params: FunctionCallParams):
             )
 
             if resp.status == 200:
-                data = await resp.json()
+                data = await _safe_json(resp, "lookup-appointment")
                 if data.get("found"):
                     await params.result_callback({
                         "found": True,
@@ -735,6 +687,7 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
                     "phone": phone,
                     "newDate": new_date,
                     "newTime": slot["start"],
+                    "timeSlot": slot["period"],
                 },
                 headers=_agent_headers(config),
                 timeout=aiohttp.ClientTimeout(total=10),
@@ -747,6 +700,8 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
                 })
                 logger.info(f"Rescheduled for {phone} to {new_date} ({slot['period']} window)")
             else:
+                text = await resp.text()
+                logger.error(f"Reschedule API error: {resp.status} {text}")
                 await params.result_callback({"error": "Couldn't reschedule that appointment."})
     except Exception as e:
         logger.error(f"Reschedule error: {e}")

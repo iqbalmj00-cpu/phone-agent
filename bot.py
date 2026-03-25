@@ -65,6 +65,7 @@ from agent.handlers import (
     handle_cancel_appointment,
     handle_transfer_to_human,
     handle_validate_promo_code,
+    handle_send_sms,
     set_call_context,
     set_pipeline_task,
     clear_call_context,
@@ -157,6 +158,15 @@ tools = ToolsSchema(standard_tools=[
             "date": {"type": "string", "description": "Date in YYYY-MM-DD format to check availability for"},
         },
         required=["date"],
+    ),
+    FunctionSchema(
+        name="send_sms",
+        description="Send a text message to the caller using a fixed template. Use to send the website booking link or a follow-up message.",
+        properties={
+            "template": {"type": "string", "enum": ["website_link", "follow_up"], "description": "Template to use: 'website_link' for booking link, 'follow_up' for post-call follow-up"},
+            "phone": {"type": "string", "description": "Phone number to text (optional, defaults to caller's number)"},
+        },
+        required=["template"],
     ),
 ])
 
@@ -272,6 +282,7 @@ async def run_bot(
     )
     llm.register_function("validate_promo_code", handle_validate_promo_code)
     llm.register_function("check_available_slots", handle_check_available_slots)
+    llm.register_function("send_sms", handle_send_sms)
 
     # ── Pipeline ────────────────────────────────────────
     sentence_aggregator = SentenceAggregator()

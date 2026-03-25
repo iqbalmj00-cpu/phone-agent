@@ -845,3 +845,155 @@ async def handle_transfer_to_human(params: FunctionCallParams):
             "transferred": False,
             "message": "I'm having trouble with the transfer right now. Let me take your info and have someone call you back within the hour.",
         })
+
+
+# ── SMS Messaging ──────────────────────────────────────
+
+# Fixed SMS templates — LLM picks a template name and supplies variables.
+_SMS_TEMPLATES: dict[str, str] = {
+    "website_link": (
+        "{company_name}: Thanks for calling! You can get a free estimate "
+        "and book online in under 2 minutes — super quick and easy 👇\n\n"
+        "{website_url}"
+    ),
+    "follow_up": (
+        "{company_name}: Thanks for calling! Whenever you're ready, you can "
+        "get a free estimate and book online in under 2 minutes — no phone "
+        "call needed 👇\n\n"
+        "{website_url}\n\n"
+        "Or call us back anytime at {company_phone} — we're here "
+        "{days_str}, {hours_str}."
+    ),
+}
+
+
+def _build_sms_body(template_name: str, config: dict[str, Any]) -> str | None:
+    """Render an SMS template with config values. Returns None for unknown templates."""
+    template = _SMS_TEMPLATES.get(template_name)
+    if not template:
+        return None
+
+    company_name = config.get("companyName", "Junk Removal")
+    website_url = config.get("websiteUrl", "")
+    # Use forwardingPhone as company phone; fall back to twilioNumber
+    company_phone = config.get("forwardingPhone") or config.get("twilioNumber", "")
+
+    # Build business hours string
+    business_start = config.get("businessStart", 7)
+    business_end = config.get("businessEnd", 19)
+    business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
+    day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    active_days = [day_names[d] for d in business_days if 0 <= d <= 6]
+    days_str = (
+        f"{active_days[0]} through {active_days[-1]}"
+        if len(active_days) > 1
+        else active_days[0] if active_days else "Monday through Saturday"
+    )
+
+    def fmt_hour(h: int) -> str:
+        if h == 0:
+            return "12 AM"
+        elif h < 12:
+            return f"{h} AM"
+        elif h == 12:
+            return "12 PM"
+        else:
+            return f"{h - 12} PM"
+
+    hours_str = f"{fmt_hour(business_start)} to {fmt_hour(business_end)}"
+
+    return template.format(
+        company_name=company_name,
+        website_url=website_url,
+        company_phone=company_phone,
+        days_str=days_str,
+        hours_str=hours_str,
+    )
+
+
+async def handle_send_sms(params: FunctionCallParams):
+    """Send a fixed-template SMS to the caller via Twilio.
+
+    Triple-gated: smsEnabled must be true, twilioNumber must exist,
+    and caller_number (or explicit phone arg) must be available.
+
+    Uses the platform's Twilio credentials but sends FROM the client's
+    provisioned phone number so the SMS appears to come from them.
+    """
+    config = _get_config()
+    ctx = _get_context()
+    template_name = params.arguments.get("template", "")
+    explicit_phone = params.arguments.get("phone", "")
+
+    # ── Gate 1: smsEnabled ──
+    if not config.get("smsEnabled", False):
+        logger.info("SMS disabled for this client — skipping send_sms")
+        await params.result_callback({
+            "sent": False,
+            "message": "I'm not able to send texts right now, but I can give you the details verbally.",
+        })
+        return
+
+    # ── Gate 2: twilioNumber (from= number) ──
+    twilio_number = config.get("twilioNumber")
+    if not twilio_number:
+        logger.warning("No twilioNumber configured — cannot send SMS")
+        await params.result_callback({
+            "sent": False,
+            "message": "I'm not able to send texts right now, but let me give you the information.",
+        })
+        return
+
+    # ── Gate 3: recipient number ──
+    to_number = explicit_phone or ctx.get("caller_number", "")
+    if not to_number:
+        logger.warning("No recipient phone number — cannot send SMS")
+        await params.result_callback({
+            "sent": False,
+            "message": "I don't have a number to text. What's the best number to reach you at?",
+        })
+        return
+
+    # ── Gate 4: websiteUrl required for both templates ──
+    website_url = config.get("websiteUrl")
+    if not website_url:
+        logger.info("No websiteUrl configured — cannot send website link SMS")
+        await params.result_callback({
+            "sent": False,
+            "message": "I'm not able to send a link right now, but you can search for us online to find our website.",
+        })
+        return
+
+    # ── Build message from template ──
+    body = _build_sms_body(template_name, config)
+    if not body:
+        logger.error(f"Unknown SMS template: {template_name}")
+        await params.result_callback({
+            "sent": False,
+            "message": "I had trouble sending that text. Let me give you the information verbally instead.",
+        })
+        return
+
+    # ── Send via Twilio ──
+    try:
+        client = _get_twilio_client()
+        result = await asyncio.to_thread(
+            client.messages.create,
+            to=to_number if to_number.startswith("+") else f"+1{to_number.replace('-', '').replace(' ', '')}",
+            from_=twilio_number,
+            body=body,
+        )
+
+        logger.info(f"SMS sent (SID: {result.sid}) template={template_name} to={to_number} from={twilio_number}")
+
+        await params.result_callback({
+            "sent": True,
+            "message": "Text message sent successfully.",
+        })
+
+    except Exception as e:
+        logger.error(f"SMS send failed: {e}")
+        await params.result_callback({
+            "sent": False,
+            "message": "I had trouble sending that text, but no worries — let me give you the details.",
+        })

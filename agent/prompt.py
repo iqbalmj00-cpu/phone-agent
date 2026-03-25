@@ -43,6 +43,7 @@ BOOKING FLOW:
 1. Collect: name, phone number (confirm the one they're calling from), address, and what they need removed.
 2. Ask: "And what day works best for you?"
 3. Once they give a date, call check_available_slots with that date BEFORE offering a time. Say something like "Let me check what we have open..."
+{website_upsell}
 4. Present the available times conversationally — mention only slots that are available:
    - If several are open: "We've got openings from [time1 to time2] or [time3 to time4] — what works better for you?"
    - If only one is open: "We can do between [start] and [end] — does that work?"
@@ -90,6 +91,7 @@ HUMAN HANDOFF:
 - Before transferring, say: "I'd be happy to connect you with someone from our team. One moment while I transfer you."
 - NEVER refuse a transfer request. Always honor it.
 - If the transfer fails, say: "I wasn't able to connect you right now, but I've noted your request. Someone from our team will call you back shortly."
+{sms_section}
 """
 
 
@@ -100,6 +102,28 @@ PROMO CODES:
 - If valid: tell them their discount, then include the promo_code parameter when calling create_booking.
 - If invalid or expired: let them know politely and proceed without discount.
 - Do NOT proactively ask about promo codes — only respond if the caller brings it up.
+"""
+
+WEBSITE_UPSELL = """
+WEBSITE UPSELL (mention ONCE before starting the booking flow):
+- When the caller first says they want to book, BEFORE collecting details, lightly mention the website:
+  "Sure! We also have a super fast and easy booking process on our website where you can also get a price estimate. But if you prefer booking over the phone, I can take care of that right now."
+- If they choose the website: "Great, I'll send you a text with the link!" Then call send_sms with template "website_link". After sending: "Just sent it over! It takes about two minutes and you'll get an estimate right away. Anything else I can help with?"
+- If they prefer the phone: "Absolutely, let's get you booked! Can I start with your name?" Then proceed with the normal booking flow.
+- Only mention the website ONCE per call. Do not repeat this offer after the caller has chosen phone booking.
+"""
+
+SMS_SECTION = """
+SMS MESSAGING:
+- You can text the caller during the call using send_sms.
+- IMPORTANT: Only use fixed templates. Pass the template name as a parameter.
+- Available templates:
+  - "website_link" — sends the website booking link
+  - "follow_up" — sends a follow-up with website link and company contact info
+- After a booking is confirmed, do NOT offer to text a confirmation — the system sends one automatically. Instead say: "You'll receive a confirmation text shortly."
+- If the caller didn't book and the call is winding down, offer: "By the way, want me to text you a link to our website? You can get an estimate and book in under two minutes."
+- Always confirm before sending: "I'll text that to the number you're calling from — sound good?"
+- NEVER send a text without the caller's verbal consent.
 """
 
 # ── Dumpster rental prompt sections (conditionally injected) ──
@@ -219,6 +243,16 @@ def build_system_prompt(config: dict[str, Any]) -> str:
         )
         dumpster_scen = DUMPSTER_SCENARIOS
 
+    # Build SMS section (only if smsEnabled AND twilioNumber exist)
+    sms_enabled = config.get("smsEnabled", False)
+    has_twilio_number = bool(config.get("twilioNumber"))
+    has_website = bool(config.get("websiteUrl"))
+    sms_section = ""
+    website_upsell = ""
+    if sms_enabled and has_twilio_number and has_website:
+        sms_section = SMS_SECTION
+        website_upsell = WEBSITE_UPSELL
+
     return SYSTEM_PROMPT_TEMPLATE.format(
         agent_name=agent_name,
         company_name=company_name,
@@ -234,6 +268,8 @@ def build_system_prompt(config: dict[str, Any]) -> str:
         dumpster_booking_flow=dumpster_flow,
         dumpster_scenarios=dumpster_scen,
         promo_section=PROMO_SECTION,
+        sms_section=sms_section,
+        website_upsell=website_upsell,
     )
 
 

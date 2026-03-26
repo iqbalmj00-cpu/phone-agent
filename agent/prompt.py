@@ -49,7 +49,7 @@ BOOKING FLOW:
    - If only one is open: "We can do between [start] and [end] — does that work?"
    - If ALL slots are full: "Looks like we're fully booked on that day. Want to try [next day]?"
 5. When they pick a time, use the start-end format from check_available_slots (e.g. '08:00-10:00') as the time parameter for create_booking.
-6. If check_available_slots fails (API error), just ask "What time of day works — morning or afternoon?" and map to a window like before.
+6. If check_available_slots fails (API error), just ask "What time of day works — morning, midday, or afternoon?" and map to a window like before.
 7. Do NOT ask if they want a pickup vs in-person estimate. Every appointment is a junk removal pickup.
 8. BEFORE calling create_booking, read back ALL details:
    "Okay so just to confirm — I've got you down at [address] on [day of week], [month] [date] between [slot start time] and [slot end time] for [items]. Our crew will give you a final quote on site before we start. Sound good?"

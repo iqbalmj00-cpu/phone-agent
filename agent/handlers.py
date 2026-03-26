@@ -113,10 +113,9 @@ async def _safe_json(resp: aiohttp.ClientResponse, label: str) -> dict:
 # ── Time Slots (must match website wizardData.ts) ───────
 
 TIME_SLOTS = {
-    "morning":   {"label": "Morning",        "start": "08:00", "end": "10:00", "start_hour": 8,  "period": "Morning"},
-    "midday":    {"label": "Midday",          "start": "10:00", "end": "12:00", "start_hour": 10, "period": "Midday"},
-    "afternoon": {"label": "Afternoon",       "start": "12:00", "end": "14:00", "start_hour": 12, "period": "Afternoon"},
-    "late":      {"label": "Late Afternoon",  "start": "14:00", "end": "16:00", "start_hour": 14, "period": "Late Afternoon"},
+    "morning":   {"label": "Morning",   "start": "08:00", "end": "11:00", "start_hour": 8,  "period": "Morning"},
+    "midday":    {"label": "Midday",    "start": "11:00", "end": "13:00", "start_hour": 11, "period": "Midday"},
+    "afternoon": {"label": "Afternoon", "start": "13:00", "end": "16:00", "start_hour": 13, "period": "Afternoon"},
 }
 
 
@@ -465,7 +464,7 @@ async def handle_create_booking(params: FunctionCallParams):
     slot = _validate_time_slot(time_slot_id)
     if not slot:
         await params.result_callback({
-            "error": "I need a valid time. Check available slots first with check_available_slots, or use: morning, midday, afternoon, or late."
+            "error": "I need a valid time. Check available slots first with check_available_slots, or use: morning, midday, or afternoon."
         })
         return
 
@@ -669,7 +668,7 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
     slot = _validate_time_slot(new_time_slot_id)
     if not slot:
         await params.result_callback({
-            "error": "Please use a valid time window: morning, midday, afternoon, or late."
+            "error": "Please use a valid time window: morning, midday, or afternoon."
         })
         return
 

@@ -86,7 +86,7 @@ tools = ToolsSchema(standard_tools=[
             "phone": {"type": "string", "description": "Customer phone number"},
             "address": {"type": "string", "description": "Service address"},
             "date": {"type": "string", "description": "YYYY-MM-DD"},
-            "time": {"type": "string", "description": "Time slot: use the start-end format from check_available_slots (e.g. '08:00-10:00'), or old labels: morning, midday, afternoon, late"},
+            "time": {"type": "string", "description": "Time slot: use the start-end format from check_available_slots (e.g. '08:00-11:00'), or labels: morning, midday, afternoon"},
             "description": {"type": "string", "description": "Items for removal, project description for dumpster, or swap reason"},
             "type": {"type": "string", "enum": ["pickup", "in_person_estimate", "dumpster_rental", "dumpster_swap"], "description": "Type of appointment. Use 'dumpster_rental' for new deliveries, 'dumpster_swap' for swapping a full container for an empty one."},
             "container_size": {"type": "string", "enum": ["10", "15", "20", "30", "40"], "description": "Container size in cubic yards (for dumpster_rental or dumpster_swap)"},
@@ -122,7 +122,7 @@ tools = ToolsSchema(standard_tools=[
         properties={
             "phone": {"type": "string", "description": "Customer phone to find booking"},
             "new_date": {"type": "string", "description": "YYYY-MM-DD"},
-            "new_time": {"type": "string", "description": "Time slot: use start-end format from check_available_slots (e.g. '08:00-10:00'), or old labels: morning, midday, afternoon, late"},
+            "new_time": {"type": "string", "description": "Time slot: use start-end format from check_available_slots (e.g. '08:00-11:00'), or labels: morning, midday, afternoon"},
         },
         required=["phone", "new_date", "new_time"],
     ),

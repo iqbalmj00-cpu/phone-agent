@@ -70,9 +70,32 @@ from agent.handlers import (
     set_pipeline_task,
     clear_call_context,
     is_booking_complete,
+    was_sms_sent,
+    send_automated_followup,
     _current_call_sid,
 )
 from agent.context import should_compress, compress_context
+
+
+# ── Automated Follow-Up SMS ─────────────────────────────
+
+FOLLOWUP_DELAY_SECONDS = 300  # 5 minutes
+
+async def _delayed_followup_sms(caller_number: str, config: dict, delay_seconds: int = FOLLOWUP_DELAY_SECONDS):
+    """Wait, then send automated follow-up SMS to callers who didn't book."""
+    try:
+        company = config.get("companyName", "unknown")
+        logger.info(f"Scheduled follow-up SMS for {caller_number} ({company}) in {delay_seconds}s")
+        await asyncio.sleep(delay_seconds)
+        sent = await send_automated_followup(caller_number, config)
+        if sent:
+            logger.info(f"Follow-up SMS delivered to {caller_number} ({company})")
+        else:
+            logger.info(f"Follow-up SMS skipped for {caller_number} ({company}) — gates not met")
+    except asyncio.CancelledError:
+        logger.debug(f"Follow-up SMS cancelled for {caller_number}")
+    except Exception as e:
+        logger.error(f"Follow-up SMS error for {caller_number}: {e}")
 
 
 # ── Tool Definitions ────────────────────────────────────
@@ -331,8 +354,20 @@ async def run_bot(
     async def on_disconnected(transport, client):
         logger.info(f"Call disconnected: {call_id}")
 
+        # Capture state BEFORE clearing context
+        booked = is_booking_complete(call_id)
+        sms_already_sent = was_sms_sent(call_id)
+        saved_caller = caller_number
+        saved_config = dict(client_config)  # shallow copy
+
         # Clean up per-call context
         clear_call_context(call_id)
+
+        # Schedule automated follow-up SMS if no booking and no SMS already sent
+        if not booked and not sms_already_sent and saved_caller:
+            asyncio.create_task(
+                _delayed_followup_sms(saved_caller, saved_config, delay_seconds=300)
+            )
 
         # Generate post-call summary
         call_end_time = datetime.now(ZoneInfo(timezone))

@@ -63,6 +63,18 @@ def is_booking_complete(call_sid: str) -> bool:
     return ctx.get("booking_complete", False)
 
 
+def mark_sms_sent(call_sid: str):
+    """Flag that an SMS was sent during this call (to avoid duplicate follow-ups)."""
+    if call_sid in _call_contexts:
+        _call_contexts[call_sid]["sms_sent"] = True
+
+
+def was_sms_sent(call_sid: str) -> bool:
+    """Check if an SMS was already sent during this call."""
+    ctx = _call_contexts.get(call_sid, {})
+    return ctx.get("sms_sent", False)
+
+
 def _get_context() -> dict[str, Any]:
     """Get the call context for the current pipeline.
 
@@ -985,6 +997,11 @@ async def handle_send_sms(params: FunctionCallParams):
 
         logger.info(f"SMS sent (SID: {result.sid}) template={template_name} to={to_number} from={twilio_number}")
 
+        # Track that SMS was sent during this call
+        ctx = _get_context()
+        if ctx.get("call_sid"):
+            mark_sms_sent(ctx["call_sid"])
+
         await params.result_callback({
             "sent": True,
             "message": "Text message sent successfully.",
@@ -996,3 +1013,46 @@ async def handle_send_sms(params: FunctionCallParams):
             "sent": False,
             "message": "I had trouble sending that text, but no worries — let me give you the details.",
         })
+
+
+# ── Automated Follow-Up SMS (called from bot.py after call ends) ──
+
+async def send_automated_followup(caller_number: str, config: dict[str, Any]) -> bool:
+    """Send an automated follow-up SMS after a no-booking call.
+
+    Called from bot.py on disconnect, NOT from an LLM tool handler.
+    Returns True if sent, False otherwise.
+    """
+    # Gate checks
+    if not config.get("smsEnabled", False):
+        logger.debug("Automated follow-up skipped: SMS disabled")
+        return False
+    twilio_number = config.get("twilioNumber")
+    if not twilio_number:
+        logger.debug("Automated follow-up skipped: no twilioNumber")
+        return False
+    if not config.get("websiteUrl"):
+        logger.debug("Automated follow-up skipped: no websiteUrl")
+        return False
+    if not caller_number:
+        logger.debug("Automated follow-up skipped: no caller number")
+        return False
+
+    body = _build_sms_body("follow_up", config)
+    if not body:
+        return False
+
+    try:
+        client = _get_twilio_client()
+        to = caller_number if caller_number.startswith("+") else f"+1{caller_number.replace('-', '').replace(' ', '')}"
+        result = await asyncio.to_thread(
+            client.messages.create,
+            to=to,
+            from_=twilio_number,
+            body=body,
+        )
+        logger.info(f"Automated follow-up SMS sent (SID: {result.sid}) to={caller_number} from={twilio_number}")
+        return True
+    except Exception as e:
+        logger.error(f"Automated follow-up SMS failed: {e}")
+        return False

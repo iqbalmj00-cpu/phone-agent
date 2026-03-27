@@ -453,8 +453,17 @@ async def handle_create_booking(params: FunctionCallParams):
     Auth: X-AGENT-SECRET header (siteToken)
     """
     config = _get_config()
+    ctx = _get_context()
     name = params.arguments["name"]
-    phone = params.arguments["phone"]
+    raw_phone = params.arguments.get("phone", "")
+    # Use the real Twilio caller number if the LLM passed garbage (e.g. "the number you're calling from")
+    import re
+    if re.search(r"\d{7,}", re.sub(r"[\s\-\(\)\+]", "", raw_phone)):
+        phone = raw_phone  # LLM passed something that looks like a real phone number
+    else:
+        phone = ctx.get("caller_number", raw_phone)  # Fall back to real Twilio caller number
+        if phone != raw_phone:
+            logger.info(f"Replaced LLM phone '{raw_phone}' with caller_number '{phone}'")
     address = params.arguments["address"]
     date = params.arguments["date"]
     time_slot_id = params.arguments.get("time")

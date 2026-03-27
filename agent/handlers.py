@@ -640,7 +640,13 @@ async def handle_lookup_appointment(params: FunctionCallParams):
     Response: { found: bool, customer?: { id, name, phone }, jobs?: [{ jobId, title, address, scheduledDate, timeSlot, status }] }
     """
     config = _get_config()
-    phone = params.arguments["phone"]
+    ctx = _get_context()
+    raw_phone = params.arguments.get("phone", "")
+    import re
+    if re.search(r"\d{7,}", re.sub(r"[\s\-\(\)\+]", "", raw_phone)):
+        phone = raw_phone
+    else:
+        phone = ctx.get("caller_number", raw_phone)
 
     try:
         async with aiohttp.ClientSession() as http:
@@ -681,7 +687,13 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
     Dashboard: POST /api/agent/reschedule { phone, newDate, newTime } with X-AGENT-SECRET auth
     """
     config = _get_config()
-    phone = params.arguments["phone"]
+    ctx = _get_context()
+    raw_phone = params.arguments.get("phone", "")
+    import re
+    if re.search(r"\d{7,}", re.sub(r"[\s\-\(\)\+]", "", raw_phone)):
+        phone = raw_phone
+    else:
+        phone = ctx.get("caller_number", raw_phone)
     new_date = params.arguments["new_date"]
     new_time_slot_id = params.arguments["new_time"]
 

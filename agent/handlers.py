@@ -285,18 +285,18 @@ async def handle_check_container_availability(params: FunctionCallParams):
                             "message": msg,
                         })
             else:
-                # API error — fall back to static pricing from config
+                # API error — do NOT proceed with booking
                 logger.warning(f"Container availability check returned {resp.status}")
                 await params.result_callback({
-                    "available": True,
-                    "message": f"I wasn't able to check live inventory, but let's go ahead and get you booked for a {size}-yard. Our team will confirm availability.",
+                    "available": False,
+                    "message": f"I wasn't able to check live inventory for the {size}-yard right now. Let me transfer you to our team to confirm availability.",
                     "fallback": True,
                 })
     except Exception as e:
         logger.error(f"Container availability check failed: {e}")
         await params.result_callback({
-            "available": True,
-            "message": f"I'm having trouble checking availability right now, but let's go ahead and get you scheduled. Our team will follow up to confirm.",
+            "available": False,
+            "message": "I'm having trouble checking availability right now. Let me transfer you to our team to confirm.",
             "fallback": True,
         })
 
@@ -457,7 +457,7 @@ async def handle_create_booking(params: FunctionCallParams):
     phone = params.arguments["phone"]
     address = params.arguments["address"]
     date = params.arguments["date"]
-    time_slot_id = params.arguments["time"]
+    time_slot_id = params.arguments.get("time")
     description = params.arguments["description"]
     booking_type = params.arguments.get("type", "pickup")
     container_size = params.arguments.get("container_size")
@@ -473,12 +473,16 @@ async def handle_create_booking(params: FunctionCallParams):
         return
 
     # ── Validate time slot ──
-    slot = _validate_time_slot(time_slot_id)
-    if not slot:
-        await params.result_callback({
-            "error": "I need a valid time. Check available slots first with check_available_slots, or use: morning, midday, or afternoon."
-        })
-        return
+    if not time_slot_id and is_dumpster and not is_swap:
+        # Dumpster rentals are all-day deliveries — no time slot needed
+        slot = {"label": "All Day", "start": "08:00", "end": "17:00", "start_hour": 8, "period": "All Day"}
+    else:
+        slot = _validate_time_slot(time_slot_id)
+        if not slot:
+            await params.result_callback({
+                "error": "I need a valid time. Check available slots first with check_available_slots, or use: morning, midday, or afternoon."
+            })
+            return
 
     # ── Business hours check ──
     if not _is_business_hours(parsed_date, slot["start_hour"], config):
@@ -692,14 +696,18 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
 
     try:
         async with aiohttp.ClientSession() as http:
-            resp = await http.post(
-                f"{DASHBOARD_URL}/api/agent/reschedule",
-                json={
+            job_id = params.arguments.get("job_id")
+            payload = {
                     "phone": phone,
                     "newDate": new_date,
                     "newTime": slot["start"],
                     "timeSlot": slot["period"],
-                },
+                }
+            if job_id:
+                payload["jobId"] = job_id
+            resp = await http.post(
+                f"{DASHBOARD_URL}/api/agent/reschedule",
+                json=payload,
                 headers=_agent_headers(config),
                 timeout=aiohttp.ClientTimeout(total=10),
             )
@@ -731,12 +739,16 @@ async def handle_cancel_appointment(params: FunctionCallParams):
 
     try:
         async with aiohttp.ClientSession() as http:
-            resp = await http.post(
-                f"{DASHBOARD_URL}/api/agent/cancel",
-                json={
+            job_id = params.arguments.get("job_id")
+            payload = {
                     "phone": phone,
                     "reason": reason,
-                },
+                }
+            if job_id:
+                payload["jobId"] = job_id
+            resp = await http.post(
+                f"{DASHBOARD_URL}/api/agent/cancel",
+                json=payload,
                 headers=_agent_headers(config),
                 timeout=aiohttp.ClientTimeout(total=10),
             )

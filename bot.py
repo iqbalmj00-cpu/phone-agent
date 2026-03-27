@@ -116,7 +116,7 @@ tools = ToolsSchema(standard_tools=[
             "rental_duration_days": {"type": "integer", "description": "Rental duration in days, default 7 (only for dumpster_rental)"},
             "promo_code": {"type": "string", "description": "Validated promo code to apply discount (optional)"},
         },
-        required=["name", "phone", "address", "date", "time", "description", "type"],
+        required=["name", "phone", "address", "date", "description", "type"],
     ),
     FunctionSchema(
         name="check_container_availability",
@@ -146,6 +146,7 @@ tools = ToolsSchema(standard_tools=[
             "phone": {"type": "string", "description": "Customer phone to find booking"},
             "new_date": {"type": "string", "description": "YYYY-MM-DD"},
             "new_time": {"type": "string", "description": "Time slot: use start-end format from check_available_slots (e.g. '08:00-11:00'), or labels: morning, midday, afternoon"},
+            "job_id": {"type": "string", "description": "Job ID from lookup_appointment to target a specific booking (required when customer has multiple bookings)"},
         },
         required=["phone", "new_date", "new_time"],
     ),
@@ -155,6 +156,7 @@ tools = ToolsSchema(standard_tools=[
         properties={
             "phone": {"type": "string", "description": "Customer phone to find booking"},
             "reason": {"type": "string", "description": "Reason for cancellation"},
+            "job_id": {"type": "string", "description": "Job ID from lookup_appointment to target a specific booking (required when customer has multiple bookings)"},
         },
         required=["phone"],
     ),

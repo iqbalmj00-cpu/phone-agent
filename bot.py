@@ -69,7 +69,9 @@ from agent.handlers import (
     set_pipeline_task,
     clear_call_context,
     is_booking_complete,
+    was_transfer_complete,
     send_automated_followup,
+    log_call_to_dashboard,
     _current_call_sid,
 )
 from agent.context import should_compress, compress_context
@@ -346,8 +348,10 @@ async def run_bot(
 
         # Capture state BEFORE clearing context
         booked = is_booking_complete(call_id)
+        transferred = was_transfer_complete(call_id)
         saved_caller = caller_number
         saved_config = dict(client_config)  # shallow copy
+        saved_twilio_number = client_config.get("twilioNumber", "")
 
         # Clean up per-call context
         clear_call_context(call_id)
@@ -381,6 +385,28 @@ async def run_bot(
             summary = "Summary unavailable"
 
         logger.info(f"Call summary [{call_id}] ({duration_s}s): {summary}")
+
+        # Determine call outcome
+        if booked:
+            outcome = "booked"
+        elif transferred:
+            outcome = "transferred"
+        elif duration_s < 10:
+            outcome = "voicemail"
+        else:
+            outcome = "info_only"
+
+        # Log call to dashboard (fire-and-forget)
+        asyncio.create_task(log_call_to_dashboard(
+            config=saved_config,
+            twilio_call_sid=call_id,
+            from_number=saved_caller or "",
+            to_number=saved_twilio_number,
+            duration=duration_s,
+            outcome=outcome,
+            summary=summary or "",
+        ))
+
         await task.cancel()
 
     # ── Track caller speech for post-booking silence timer ──

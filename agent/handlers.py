@@ -75,6 +75,18 @@ def was_sms_sent(call_sid: str) -> bool:
     return ctx.get("sms_sent", False)
 
 
+def mark_transfer_complete(call_sid: str):
+    """Flag that the call was transferred to a human."""
+    if call_sid in _call_contexts:
+        _call_contexts[call_sid]["transfer_complete"] = True
+
+
+def was_transfer_complete(call_sid: str) -> bool:
+    """Check if a transfer was completed during this call."""
+    ctx = _call_contexts.get(call_sid, {})
+    return ctx.get("transfer_complete", False)
+
+
 def _get_context() -> dict[str, Any]:
     """Get the call context for the current pipeline.
 
@@ -877,6 +889,10 @@ async def handle_transfer_to_human(params: FunctionCallParams):
             "message": "Transferring the call now.",
         })
 
+        # Flag transfer in per-call context for call-log outcome
+        if ctx.get("call_sid"):
+            mark_transfer_complete(ctx["call_sid"])
+
         # Cancel the AI pipeline — the call audio stream will end
         pipeline_task = ctx.get("pipeline_task")
         if pipeline_task:
@@ -1030,6 +1046,17 @@ async def handle_send_sms(params: FunctionCallParams):
         if ctx.get("call_sid"):
             mark_sms_sent(ctx["call_sid"])
 
+        # Log to dashboard (fire-and-forget)
+        asyncio.create_task(_log_sms_to_dashboard(
+            config=config,
+            to_number=to_number,
+            from_number=twilio_number,
+            template_name=template_name,
+            sms_type="in_call",
+            twilio_call_sid=ctx.get("call_sid", ""),
+            twilio_sms_sid=result.sid,
+        ))
+
         await params.result_callback({
             "sent": True,
             "message": "Text message sent successfully.",
@@ -1098,7 +1125,100 @@ async def send_automated_followup(caller_number: str, config: dict[str, Any]) ->
         )
         logger.info(f"Automated follow-up SMS sent (SID: {result.sid}) to={caller_number} from={twilio_number}")
         _sms_cooldown[key] = datetime.now()
+
+        # Log to dashboard (fire-and-forget)
+        asyncio.create_task(_log_sms_to_dashboard(
+            config=config,
+            to_number=caller_number,
+            from_number=twilio_number,
+            template_name="follow_up",
+            sms_type="automated",
+            twilio_call_sid="",
+            twilio_sms_sid=result.sid,
+        ))
+
         return True
     except Exception as e:
         logger.error(f"Automated follow-up SMS failed: {e}")
         return False
+
+
+# ── Dashboard Logging Helpers ──────────────────────────────────
+
+async def _log_sms_to_dashboard(
+    config: dict[str, Any],
+    to_number: str,
+    from_number: str,
+    template_name: str,
+    sms_type: str,
+    twilio_call_sid: str = "",
+    twilio_sms_sid: str = "",
+) -> None:
+    """Fire-and-forget POST to dashboard SMS log endpoint."""
+    try:
+        payload = {
+            "toNumber": to_number,
+            "fromNumber": from_number,
+            "templateName": template_name,
+            "type": sms_type,
+        }
+        if twilio_call_sid:
+            payload["twilioCallSid"] = twilio_call_sid
+        if twilio_sms_sid:
+            payload["twilioSmsSid"] = twilio_sms_sid
+
+        async with aiohttp.ClientSession() as http:
+            resp = await http.post(
+                f"{DASHBOARD_URL}/api/agent/sms-log",
+                json=payload,
+                headers=_agent_headers(config),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+            if resp.status == 201:
+                logger.debug(f"SMS log recorded for {to_number}")
+            else:
+                body = await resp.text()
+                logger.warning(f"SMS log failed ({resp.status}): {body[:200]}")
+    except Exception as e:
+        logger.error(f"SMS log POST error: {e}")
+
+
+async def log_call_to_dashboard(
+    config: dict[str, Any],
+    twilio_call_sid: str,
+    from_number: str,
+    to_number: str,
+    duration: int,
+    outcome: str,
+    summary: str = "",
+    appointment_date: str = "",
+) -> None:
+    """Fire-and-forget POST to dashboard call log endpoint."""
+    try:
+        payload: dict[str, Any] = {
+            "twilioCallSid": twilio_call_sid,
+            "fromNumber": from_number,
+            "duration": duration,
+            "outcome": outcome,
+        }
+        if to_number:
+            payload["toNumber"] = to_number
+        if summary:
+            payload["summary"] = summary
+        if appointment_date:
+            payload["appointmentDate"] = appointment_date
+
+        async with aiohttp.ClientSession() as http:
+            resp = await http.post(
+                f"{DASHBOARD_URL}/api/agent/call-log",
+                json=payload,
+                headers=_agent_headers(config),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+            if resp.status == 201:
+                logger.info(f"Call log recorded: {twilio_call_sid} outcome={outcome}")
+            else:
+                body = await resp.text()
+                logger.warning(f"Call log failed ({resp.status}): {body[:200]}")
+    except Exception as e:
+        logger.error(f"Call log POST error: {e}")

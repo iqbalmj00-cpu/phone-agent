@@ -895,11 +895,6 @@ async def handle_transfer_to_human(params: FunctionCallParams):
 
 # Fixed SMS templates — LLM picks a template name and supplies variables.
 _SMS_TEMPLATES: dict[str, str] = {
-    "website_link": (
-        "{company_name}: Thanks for calling! You can get a free estimate "
-        "and book online in under 2 minutes — super quick and easy 👇\n\n"
-        "{website_url}?utm_source=phone_agent&utm_medium=sms&utm_campaign=website_link"
-    ),
     "follow_up": (
         "{company_name}: Thanks for calling! Whenever you're ready, you can "
         "get a free estimate and book online in under 2 minutes — no phone "

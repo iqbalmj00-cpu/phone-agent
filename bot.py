@@ -65,12 +65,10 @@ from agent.handlers import (
     handle_cancel_appointment,
     handle_transfer_to_human,
     handle_validate_promo_code,
-    handle_send_sms,
     set_call_context,
     set_pipeline_task,
     clear_call_context,
     is_booking_complete,
-    was_sms_sent,
     send_automated_followup,
     _current_call_sid,
 )
@@ -183,15 +181,6 @@ tools = ToolsSchema(standard_tools=[
             "date": {"type": "string", "description": "Date in YYYY-MM-DD format to check availability for"},
         },
         required=["date"],
-    ),
-    FunctionSchema(
-        name="send_sms",
-        description="Send a text message to the caller using a fixed template. Use to send the website booking link or a follow-up message.",
-        properties={
-            "template": {"type": "string", "enum": ["website_link", "follow_up"], "description": "Template to use: 'website_link' for booking link, 'follow_up' for post-call follow-up"},
-            "phone": {"type": "string", "description": "Phone number to text (optional, defaults to caller's number)"},
-        },
-        required=["template"],
     ),
 ])
 
@@ -307,7 +296,6 @@ async def run_bot(
     )
     llm.register_function("validate_promo_code", handle_validate_promo_code)
     llm.register_function("check_available_slots", handle_check_available_slots)
-    llm.register_function("send_sms", handle_send_sms)
 
     # ── Pipeline ────────────────────────────────────────
     sentence_aggregator = SentenceAggregator()
@@ -358,15 +346,14 @@ async def run_bot(
 
         # Capture state BEFORE clearing context
         booked = is_booking_complete(call_id)
-        sms_already_sent = was_sms_sent(call_id)
         saved_caller = caller_number
         saved_config = dict(client_config)  # shallow copy
 
         # Clean up per-call context
         clear_call_context(call_id)
 
-        # Schedule automated follow-up SMS if no booking and no SMS already sent
-        if not booked and not sms_already_sent and saved_caller:
+        # Schedule automated follow-up SMS if no booking was made
+        if not booked and saved_caller:
             asyncio.create_task(
                 _delayed_followup_sms(saved_caller, saved_config, delay_seconds=300)
             )

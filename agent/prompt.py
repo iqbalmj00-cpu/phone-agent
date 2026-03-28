@@ -105,25 +105,20 @@ PROMO CODES:
 """
 
 WEBSITE_UPSELL = """
-WEBSITE UPSELL (mention ONCE before starting the booking flow):
+WEBSITE MENTION (mention ONCE before starting the booking flow):
 - When the caller first says they want to book, BEFORE collecting details, lightly mention the website:
   "Sure! We also have a super fast and easy booking process on our website where you can also get a price estimate. But if you prefer booking over the phone, I can take care of that right now."
-- If they choose the website: "Great, I'll send you a text with the link!" Then call send_sms with template "website_link". After sending: "Just sent it over! It takes about two minutes and you'll get an estimate right away. Anything else I can help with?"
+- If they choose the website: "No problem! After we hang up, I'll text you a link to our website so you can book whenever you're ready. Is there anything else I can help with?"
 - If they prefer the phone: "Absolutely, let's get you booked! Can I start with your name?" Then proceed with the normal booking flow.
 - Only mention the website ONCE per call. Do not repeat this offer after the caller has chosen phone booking.
 """
 
 SMS_SECTION = """
 SMS MESSAGING:
-- You can text the caller during the call using send_sms.
-- IMPORTANT: Only use fixed templates. Pass the template name as a parameter.
-- Available templates:
-  - "website_link" — sends the website booking link
-  - "follow_up" — sends a follow-up with website link and company contact info
+- You do NOT have the ability to send text messages during the call.
+- The system automatically sends a follow-up text with a website link after the call ends IF the caller did not book.
 - After a booking is confirmed, do NOT offer to text a confirmation — the system sends one automatically. Instead say: "You'll receive a confirmation text shortly."
-- If the caller didn't book and the call is winding down, offer: "By the way, want me to text you a link to our website? You can get an estimate and book in under two minutes."
-- Always confirm before sending: "I'll text that to the number you're calling from — sound good?"
-- NEVER send a text without the caller's verbal consent.
+- If the caller asks about getting a text or link: "After we hang up, we'll send you a text with a link to our website so you can book online whenever you're ready."
 """
 
 # ── Dumpster rental prompt sections (conditionally injected) ──

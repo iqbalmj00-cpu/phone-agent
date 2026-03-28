@@ -17,7 +17,7 @@ import asyncio
 import contextvars
 import json
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -1045,6 +1045,16 @@ async def handle_send_sms(params: FunctionCallParams):
 
 # ── Automated Follow-Up SMS (called from bot.py after call ends) ──
 
+# 24-hour cooldown — keyed by normalized phone number
+_sms_cooldown: dict[str, datetime] = {}
+SMS_COOLDOWN_HOURS = 24
+
+
+def _normalize_phone(phone: str) -> str:
+    """Strip a phone to digits only for consistent cooldown keying."""
+    return "".join(c for c in phone if c.isdigit())
+
+
 async def send_automated_followup(caller_number: str, config: dict[str, Any]) -> bool:
     """Send an automated follow-up SMS after a no-booking call.
 
@@ -1066,6 +1076,13 @@ async def send_automated_followup(caller_number: str, config: dict[str, Any]) ->
         logger.debug("Automated follow-up skipped: no caller number")
         return False
 
+    # ── 24-hour cooldown check ──
+    key = _normalize_phone(caller_number)
+    last_sent = _sms_cooldown.get(key)
+    if last_sent and (datetime.now() - last_sent) < timedelta(hours=SMS_COOLDOWN_HOURS):
+        logger.info(f"Automated follow-up skipped: SMS already sent to {caller_number} within {SMS_COOLDOWN_HOURS}h")
+        return False
+
     body = _build_sms_body("follow_up", config)
     if not body:
         return False
@@ -1080,6 +1097,7 @@ async def send_automated_followup(caller_number: str, config: dict[str, Any]) ->
             body=body,
         )
         logger.info(f"Automated follow-up SMS sent (SID: {result.sid}) to={caller_number} from={twilio_number}")
+        _sms_cooldown[key] = datetime.now()
         return True
     except Exception as e:
         logger.error(f"Automated follow-up SMS failed: {e}")

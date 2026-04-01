@@ -65,11 +65,13 @@ from agent.handlers import (
     handle_cancel_appointment,
     handle_transfer_to_human,
     handle_validate_promo_code,
+    handle_record_sms_consent,
     set_call_context,
     set_pipeline_task,
     clear_call_context,
     is_booking_complete,
     was_transfer_complete,
+    has_sms_consent,
     send_automated_followup,
     log_call_to_dashboard,
     _current_call_sid,
@@ -87,7 +89,7 @@ async def _delayed_followup_sms(caller_number: str, config: dict, delay_seconds:
         company = config.get("companyName", "unknown")
         logger.info(f"Scheduled follow-up SMS for {caller_number} ({company}) in {delay_seconds}s")
         await asyncio.sleep(delay_seconds)
-        sent = await send_automated_followup(caller_number, config)
+        sent = await send_automated_followup(caller_number, config, sms_consented=True)
         if sent:
             logger.info(f"Follow-up SMS delivered to {caller_number} ({company})")
         else:
@@ -183,6 +185,14 @@ tools = ToolsSchema(standard_tools=[
             "date": {"type": "string", "description": "Date in YYYY-MM-DD format to check availability for"},
         },
         required=["date"],
+    ),
+    FunctionSchema(
+        name="record_sms_consent",
+        description="Record whether the caller consented to receiving text messages. Call this IMMEDIATELY after asking for SMS consent and receiving a clear yes or no answer. You MUST call this before any text-related action.",
+        properties={
+            "consented": {"type": "boolean", "description": "True if caller said yes to receiving texts, false if they declined"},
+        },
+        required=["consented"],
     ),
 ])
 
@@ -298,6 +308,7 @@ async def run_bot(
     )
     llm.register_function("validate_promo_code", handle_validate_promo_code)
     llm.register_function("check_available_slots", handle_check_available_slots)
+    llm.register_function("record_sms_consent", handle_record_sms_consent)
 
     # ── Pipeline ────────────────────────────────────────
     sentence_aggregator = SentenceAggregator()
@@ -349,6 +360,7 @@ async def run_bot(
         # Capture state BEFORE clearing context
         booked = is_booking_complete(call_id)
         transferred = was_transfer_complete(call_id)
+        sms_consented = has_sms_consent(call_id)
         saved_caller = caller_number
         saved_config = dict(client_config)  # shallow copy
         saved_twilio_number = client_config.get("twilioNumber", "")
@@ -356,8 +368,8 @@ async def run_bot(
         # Clean up per-call context
         clear_call_context(call_id)
 
-        # Schedule automated follow-up SMS if no booking was made
-        if not booked and saved_caller:
+        # Schedule automated follow-up SMS only if consent was explicitly given
+        if not booked and saved_caller and sms_consented is True:
             asyncio.create_task(
                 _delayed_followup_sms(saved_caller, saved_config, delay_seconds=300)
             )
@@ -405,6 +417,7 @@ async def run_bot(
             duration=duration_s,
             outcome=outcome,
             summary=summary or "",
+            sms_consent=sms_consented,
         ))
 
         await task.cancel()

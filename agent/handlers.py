@@ -87,6 +87,44 @@ def was_transfer_complete(call_sid: str) -> bool:
     return ctx.get("transfer_complete", False)
 
 
+def mark_sms_consent(call_sid: str, consented: bool):
+    """Record the caller's SMS consent decision."""
+    if call_sid in _call_contexts:
+        _call_contexts[call_sid]["sms_consent"] = consented
+
+
+def has_sms_consent(call_sid: str) -> bool | None:
+    """Check SMS consent status. Returns None if not yet asked."""
+    ctx = _call_contexts.get(call_sid, {})
+    return ctx.get("sms_consent", None)
+
+
+async def handle_record_sms_consent(params: FunctionCallParams):
+    """Record the caller's verbal SMS consent decision.
+
+    Called by the LLM after explicitly asking the caller if they agree
+    to receive text messages and receiving a clear yes/no answer.
+    """
+    ctx = _get_context()
+    consented = params.arguments.get("consented", False)
+    call_sid = ctx.get("call_sid", "")
+
+    if call_sid:
+        mark_sms_consent(call_sid, consented)
+        logger.info(f"SMS consent recorded for call {call_sid}: {'opted-in' if consented else 'declined'}")
+
+    if consented:
+        await params.result_callback({
+            "recorded": True,
+            "message": "SMS consent recorded. You may now offer to send texts.",
+        })
+    else:
+        await params.result_callback({
+            "recorded": True,
+            "message": "Customer declined SMS. Do not mention texting for the rest of this call.",
+        })
+
+
 def _get_context() -> dict[str, Any]:
     """Get the call context for the current pipeline.
 
@@ -549,6 +587,18 @@ async def handle_create_booking(params: FunctionCallParams):
     if promo_code:
         payload["promoCode"] = promo_code
 
+    # ── Include SMS consent in booking payload ──
+    # Critical: dashboard sends confirmation SMS immediately on booking creation.
+    # Consent must arrive WITH the booking, not after-the-fact in the call-log.
+    call_sid = ctx.get("call_sid", "")
+    consent_value = has_sms_consent(call_sid) if call_sid else None
+    payload["smsConsent"] = {
+        "optedIn": consent_value if consent_value is not None else False,
+        "source": "phone_agent",
+        "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
+        "consentTextVersion": "v1",
+    }
+
     try:
         async with aiohttp.ClientSession() as http:
             resp = await http.post(
@@ -980,6 +1030,17 @@ async def handle_send_sms(params: FunctionCallParams):
     template_name = params.arguments.get("template", "")
     explicit_phone = params.arguments.get("phone", "")
 
+    # ── Gate 0: SMS consent ──
+    call_sid = ctx.get("call_sid", "")
+    consent = has_sms_consent(call_sid) if call_sid else None
+    if consent is not True:
+        logger.info(f"SMS blocked: no consent for call {call_sid} (consent={consent})")
+        await params.result_callback({
+            "sent": False,
+            "message": "I can give you the details verbally instead.",
+        })
+        return
+
     # ── Gate 1: smsEnabled ──
     if not config.get("smsEnabled", False):
         logger.info("SMS disabled for this client — skipping send_sms")
@@ -1029,41 +1090,46 @@ async def handle_send_sms(params: FunctionCallParams):
         })
         return
 
-    # ── Send via Twilio ──
+    # ── Send via dashboard SMS endpoint (enforces A2P, consent, suppression gates) ──
     try:
-        client = _get_twilio_client()
-        result = await asyncio.to_thread(
-            client.messages.create,
-            to=to_number if to_number.startswith("+") else f"+1{to_number.replace('-', '').replace(' ', '')}",
-            from_=twilio_number,
-            body=body,
-        )
+        normalized_to = to_number if to_number.startswith("+") else f"+1{to_number.replace('-', '').replace(' ', '')}"
+        async with aiohttp.ClientSession() as http:
+            resp = await http.post(
+                f"{DASHBOARD_URL}/api/agent/sms/send",
+                json={
+                    "clientId": config.get("clientId", ""),
+                    "to": normalized_to,
+                    "message": body,
+                    "consentGranted": True,
+                    "consentSource": "phone_agent",
+                },
+                headers=_agent_headers(config),
+                timeout=aiohttp.ClientTimeout(total=15),
+            )
+            data = await _safe_json(resp, "agent-sms-send")
 
-        logger.info(f"SMS sent (SID: {result.sid}) template={template_name} to={to_number} from={twilio_number}")
+        if data.get("success"):
+            logger.info(f"SMS sent via dashboard: template={template_name} to={to_number} sid={data.get('sid', 'n/a')}")
 
-        # Track that SMS was sent during this call
-        ctx = _get_context()
-        if ctx.get("call_sid"):
-            mark_sms_sent(ctx["call_sid"])
+            # Track that SMS was sent during this call
+            ctx = _get_context()
+            if ctx.get("call_sid"):
+                mark_sms_sent(ctx["call_sid"])
 
-        # Log to dashboard (fire-and-forget)
-        asyncio.create_task(_log_sms_to_dashboard(
-            config=config,
-            to_number=to_number,
-            from_number=twilio_number,
-            template_name=template_name,
-            sms_type="in_call",
-            twilio_call_sid=ctx.get("call_sid", ""),
-            twilio_sms_sid=result.sid,
-        ))
-
-        await params.result_callback({
-            "sent": True,
-            "message": "Text message sent successfully.",
-        })
+            await params.result_callback({
+                "sent": True,
+                "message": "Text message sent successfully.",
+            })
+        else:
+            error = data.get("error", "unknown")
+            logger.info(f"SMS blocked by dashboard: {error} (template={template_name} to={to_number})")
+            await params.result_callback({
+                "sent": False,
+                "message": "I'm not able to send texts right now, but I can give you the details verbally.",
+            })
 
     except Exception as e:
-        logger.error(f"SMS send failed: {e}")
+        logger.error(f"SMS send via dashboard failed: {e}")
         await params.result_callback({
             "sent": False,
             "message": "I had trouble sending that text, but no worries — let me give you the details.",
@@ -1082,12 +1148,17 @@ def _normalize_phone(phone: str) -> str:
     return "".join(c for c in phone if c.isdigit())
 
 
-async def send_automated_followup(caller_number: str, config: dict[str, Any]) -> bool:
+async def send_automated_followup(caller_number: str, config: dict[str, Any], sms_consented: bool = False) -> bool:
     """Send an automated follow-up SMS after a no-booking call.
 
     Called from bot.py on disconnect, NOT from an LLM tool handler.
     Returns True if sent, False otherwise.
     """
+    # Gate: explicit consent required
+    if not sms_consented:
+        logger.info(f"Automated follow-up skipped: no SMS consent for {caller_number}")
+        return False
+
     # Gate checks
     if not config.get("smsEnabled", False):
         logger.debug("Automated follow-up skipped: SMS disabled")
@@ -1115,29 +1186,30 @@ async def send_automated_followup(caller_number: str, config: dict[str, Any]) ->
         return False
 
     try:
-        client = _get_twilio_client()
-        to = caller_number if caller_number.startswith("+") else f"+1{caller_number.replace('-', '').replace(' ', '')}"
-        result = await asyncio.to_thread(
-            client.messages.create,
-            to=to,
-            from_=twilio_number,
-            body=body,
-        )
-        logger.info(f"Automated follow-up SMS sent (SID: {result.sid}) to={caller_number} from={twilio_number}")
-        _sms_cooldown[key] = datetime.now()
+        normalized_to = caller_number if caller_number.startswith("+") else f"+1{caller_number.replace('-', '').replace(' ', '')}"
+        async with aiohttp.ClientSession() as http:
+            resp = await http.post(
+                f"{DASHBOARD_URL}/api/agent/sms/send",
+                json={
+                    "clientId": config.get("clientId", ""),
+                    "to": normalized_to,
+                    "message": body,
+                    "consentGranted": True,
+                    "consentSource": "phone_agent",
+                },
+                headers=_agent_headers(config),
+                timeout=aiohttp.ClientTimeout(total=15),
+            )
+            data = await _safe_json(resp, "agent-sms-followup")
 
-        # Log to dashboard (fire-and-forget)
-        asyncio.create_task(_log_sms_to_dashboard(
-            config=config,
-            to_number=caller_number,
-            from_number=twilio_number,
-            template_name="follow_up",
-            sms_type="automated",
-            twilio_call_sid="",
-            twilio_sms_sid=result.sid,
-        ))
-
-        return True
+        if data.get("success"):
+            logger.info(f"Automated follow-up SMS sent via dashboard: to={caller_number} sid={data.get('sid', 'n/a')}")
+            _sms_cooldown[key] = datetime.now()
+            return True
+        else:
+            error = data.get("error", "unknown")
+            logger.info(f"Automated follow-up SMS blocked by dashboard: {error} (to={caller_number})")
+            return False
     except Exception as e:
         logger.error(f"Automated follow-up SMS failed: {e}")
         return False
@@ -1192,6 +1264,7 @@ async def log_call_to_dashboard(
     outcome: str,
     summary: str = "",
     appointment_date: str = "",
+    sms_consent: bool | None = None,
 ) -> None:
     """Fire-and-forget POST to dashboard call log endpoint."""
     try:
@@ -1207,6 +1280,9 @@ async def log_call_to_dashboard(
             payload["summary"] = summary
         if appointment_date:
             payload["appointmentDate"] = appointment_date
+        # Include SMS consent decision for audit trail
+        if sms_consent is not None:
+            payload["smsConsent"] = sms_consent
 
         async with aiohttp.ClientSession() as http:
             resp = await http.post(

@@ -5,7 +5,7 @@ On each incoming call, we fetch the client's config from:
   GET {DASHBOARD_URL}/api/agent/config/{client_id}
 
 The response includes: companyName, agentName, voiceId, timezone,
-businessStart, businessEnd, businessDays, smsEnabled, siteToken, etc.
+businessStart, businessEnd, businessDays, smsEnabled, siteToken, agentSecret, etc.
 
 Configs are cached in-memory for 5 minutes to reduce API calls.
 """

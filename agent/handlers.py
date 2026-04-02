@@ -145,9 +145,9 @@ def _get_config() -> dict[str, Any]:
 
 
 def _agent_headers(config: dict[str, Any]) -> dict[str, str]:
-    """Build auth headers using X-AGENT-SECRET (siteToken) — matches dashboard's agent-auth.ts."""
+    """Build auth headers using X-AGENT-SECRET (agentSecret) — matches dashboard's agent-auth.ts."""
     return {
-        "X-AGENT-SECRET": config.get("siteToken", ""),
+        "X-AGENT-SECRET": config.get("agentSecret", ""),
         "Content-Type": "application/json",
     }
 
@@ -500,7 +500,7 @@ async def handle_create_booking(params: FunctionCallParams):
 
     Dashboard expects: { customerName, customerPhone, address, volume, date, timeSlot, notes }
     Dashboard returns: { success, jobId, customerId, message } (status 201)
-    Auth: X-AGENT-SECRET header (siteToken)
+    Auth: X-AGENT-SECRET header (agentSecret)
     """
     config = _get_config()
     ctx = _get_context()

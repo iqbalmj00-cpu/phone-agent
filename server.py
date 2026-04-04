@@ -67,8 +67,8 @@ def _format_hours_label(config: dict) -> str:
     """Format business hours for the voice message."""
     start = int(config.get("businessStart", 8))
     end = int(config.get("businessEnd", 18))
-    start_label = f"{start} AM" if start < 12 else f"{start - 12} PM" if start > 12 else "12 PM"
-    end_label = f"{end} AM" if end < 12 else f"{end - 12} PM" if end > 12 else "12 PM"
+    start_label = "12 AM" if start == 0 else f"{start} AM" if start < 12 else "12 PM" if start == 12 else f"{start - 12} PM"
+    end_label = "12 AM" if end == 0 else f"{end} AM" if end < 12 else "12 PM" if end == 12 else f"{end - 12} PM"
     return f"{start_label} to {end_label}"
 
 

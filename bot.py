@@ -342,20 +342,31 @@ async def run_bot(
 
     # ── Event Handlers ──────────────────────────────────
 
+    # Track background watcher tasks so we can cancel them on disconnect
+    _timeout_task = None
+    _booking_watcher_task = None
+
     @transport.event_handler("on_client_connected")
     async def on_connected(transport, client):
+        nonlocal _timeout_task, _booking_watcher_task
         logger.info(f"Call connected: {call_id} from {caller_number} → {company_name}")
 
         # Play greeting immediately via TTS frame
         await task.queue_frames([TTSSpeakFrame(text=greeting)])
 
         # Start call duration timer and post-booking silence watcher
-        asyncio.create_task(_call_timeout_watcher(task, context))
-        asyncio.create_task(_post_booking_watcher(task, context, call_id))
+        _timeout_task = asyncio.create_task(_call_timeout_watcher(task, context))
+        _booking_watcher_task = asyncio.create_task(_post_booking_watcher(task, context, call_id))
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(transport, client):
         logger.info(f"Call disconnected: {call_id}")
+
+        # Cancel background watcher tasks
+        if _timeout_task and not _timeout_task.done():
+            _timeout_task.cancel()
+        if _booking_watcher_task and not _booking_watcher_task.done():
+            _booking_watcher_task.cancel()
 
         # Capture state BEFORE clearing context
         booked = is_booking_complete(call_id)

@@ -226,8 +226,8 @@ def _validate_time_slot(slot_id: str) -> dict | None:
 def _is_business_hours(date: datetime, hour: int, config: dict) -> bool:
     """Check if date/time falls within this client's business hours."""
     business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
-    business_start = config.get("businessStart", 7)
-    business_end = config.get("businessEnd", 19)
+    business_start = int(config.get("businessStart", 7))
+    business_end = int(config.get("businessEnd", 19))
 
     # Convert Python weekday (0=Mon) to JS convention (0=Sun) used by dashboard
     js_day = (date.weekday() + 1) % 7
@@ -545,8 +545,8 @@ async def handle_create_booking(params: FunctionCallParams):
 
     # ── Business hours check ──
     if not _is_business_hours(parsed_date, slot["start_hour"], config):
-        business_start = config.get("businessStart", 7)
-        business_end = config.get("businessEnd", 19)
+        business_start = int(config.get("businessStart", 7))
+        business_end = int(config.get("businessEnd", 19))
         await params.result_callback({
             "error": f"That's outside our hours. We're available from {_format_hour(business_start)} to {_format_hour(business_end)}."
         })
@@ -985,8 +985,8 @@ def _build_sms_body(template_name: str, config: dict[str, Any]) -> str | None:
     company_phone = config.get("forwardingPhone") or config.get("twilioNumber", "")
 
     # Build business hours string
-    business_start = config.get("businessStart", 7)
-    business_end = config.get("businessEnd", 19)
+    business_start = int(config.get("businessStart", 7))
+    business_end = int(config.get("businessEnd", 19))
     business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
     day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
     active_days = [day_names[d] for d in business_days if 0 <= d <= 6]
@@ -1174,6 +1174,12 @@ async def send_automated_followup(caller_number: str, config: dict[str, Any], sm
     if not caller_number:
         logger.debug("Automated follow-up skipped: no caller number")
         return False
+
+    # ── Prune expired cooldown entries ──
+    cutoff = datetime.now() - timedelta(hours=SMS_COOLDOWN_HOURS)
+    expired_keys = [k for k, v in _sms_cooldown.items() if v < cutoff]
+    for k in expired_keys:
+        del _sms_cooldown[k]
 
     # ── 24-hour cooldown check ──
     key = _normalize_phone(caller_number)

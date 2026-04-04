@@ -25,7 +25,7 @@ LLM_MODEL = "gpt-4.1-mini"
 # ── Cartesia ────────────────────────────────────────────
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 DEFAULT_CARTESIA_VOICE_ID = "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
-CARTESIA_MODEL = "sonic-3"
+CARTESIA_MODEL = "sonic-3-latest"
 CARTESIA_SAMPLE_RATE = 24000  # Generate at 24kHz, Pipecat resamples to 8kHz
 
 # ── Dashboard Connection ────────────────────────────────

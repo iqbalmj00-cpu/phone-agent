@@ -578,6 +578,7 @@ async def handle_create_booking(params: FunctionCallParams):
         "notes": notes,
         "type": booking_type,
         "serviceType": "dumpster_rental" if is_dumpster else "junk_removal",
+        "twilioCallSid": ctx.get("call_sid", ""),
     }
     if is_dumpster:
         payload["containerSize"] = container_size

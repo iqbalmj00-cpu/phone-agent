@@ -66,6 +66,7 @@ from agent.handlers import (
     handle_transfer_to_human,
     handle_validate_promo_code,
     handle_record_sms_consent,
+    handle_verify_address,
     set_call_context,
     set_pipeline_task,
     clear_call_context,
@@ -194,6 +195,14 @@ tools = ToolsSchema(standard_tools=[
         },
         required=["consented"],
     ),
+    FunctionSchema(
+        name="verify_address",
+        description="Verify and normalize a service address using Google Maps. Call this after the caller gives their address to confirm it's correct. Read back the verified address and ask the caller to confirm.",
+        properties={
+            "address": {"type": "string", "description": "The address as spoken by the caller, including street, city, and state if provided"},
+        },
+        required=["address"],
+    ),
 ])
 
 
@@ -309,6 +318,7 @@ async def run_bot(
     llm.register_function("validate_promo_code", handle_validate_promo_code)
     llm.register_function("check_available_slots", handle_check_available_slots)
     llm.register_function("record_sms_consent", handle_record_sms_consent)
+    llm.register_function("verify_address", handle_verify_address)
 
     # ── Pipeline ────────────────────────────────────────
     sentence_aggregator = SentenceAggregator()

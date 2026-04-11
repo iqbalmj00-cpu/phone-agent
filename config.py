@@ -32,6 +32,7 @@ CARTESIA_SAMPLE_RATE = 24000  # Generate at 24kHz, Pipecat resamples to 8kHz
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "")
 INGEST_API_KEY = os.getenv("INGEST_API_KEY", "")
 PLATFORM_API_KEY = os.getenv("PLATFORM_API_KEY", "")
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 
 # ── Rate Limits ─────────────────────────────────────────
 MAX_CALL_DURATION_SECONDS = 600  # 10 minutes

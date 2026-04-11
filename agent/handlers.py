@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 from pipecat.services.llm_service import FunctionCallParams
 
-from config import DASHBOARD_URL, INGEST_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+from config import DASHBOARD_URL, INGEST_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, GOOGLE_MAPS_API_KEY
 
 # ── Per-call context — keyed by call_sid for concurrency safety ──
 _call_contexts: dict[str, dict[str, Any]] = {}
@@ -848,6 +848,65 @@ async def handle_cancel_appointment(params: FunctionCallParams):
     except Exception as e:
         logger.error(f"Cancel error: {e}")
         await params.result_callback({"error": "I'm having trouble processing the cancellation."})
+
+
+# ── Address Verification ──────────────────────────────
+
+async def handle_verify_address(params: FunctionCallParams):
+    """Verify and normalize a caller's address using Google Geocoding API.
+
+    Returns the top formatted address result so the agent can read it back
+    and confirm with the caller before booking.
+    """
+    address = params.arguments.get("address", "")
+    if not address:
+        await params.result_callback({
+            "verified": False,
+            "message": "No address provided. Ask the caller for their full address."
+        })
+        return
+
+    if not GOOGLE_MAPS_API_KEY:
+        await params.result_callback({
+            "verified": False,
+            "message": "Address verification unavailable. Read back the address as you heard it and ask the caller to confirm."
+        })
+        return
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            resp = await http.get(
+                "https://maps.googleapis.com/maps/api/geocode/json",
+                params={"address": address, "key": GOOGLE_MAPS_API_KEY},
+                timeout=aiohttp.ClientTimeout(total=5),
+            )
+            data = await resp.json()
+
+        if data.get("status") == "OK" and data.get("results"):
+            result = data["results"][0]
+            formatted = result.get("formatted_address", "")
+            if formatted:
+                # Strip ", USA" or ", US" suffix for cleaner readback
+                formatted = formatted.replace(", USA", "").replace(", US", "")
+                await params.result_callback({
+                    "verified": True,
+                    "formatted_address": formatted,
+                    "message": f"Verified address: {formatted}. Read this back to the caller and ask if it's correct."
+                })
+                return
+
+        # No results or bad status
+        await params.result_callback({
+            "verified": False,
+            "message": "I couldn't find a match for that address. Ask the caller to repeat the full address including street number, street name, and city."
+        })
+
+    except Exception as e:
+        logger.error(f"Address verification failed: {e}")
+        await params.result_callback({
+            "verified": False,
+            "message": "Address verification unavailable right now. Read back the address as you heard it and ask the caller to confirm."
+        })
 
 
 # ── Helpers ─────────────────────────────────────────────

@@ -99,6 +99,83 @@ def has_sms_consent(call_sid: str) -> bool | None:
     return ctx.get("sms_consent", None)
 
 
+# ── Tool Failure Counter (per call, per tool) ──────────
+# Tracks how many times a given tool has hit a SYSTEM error in this call.
+# Validation errors (bad date format, slot_full, etc.) do NOT count — those
+# are LLM-correctable. Only network/API/exception failures count.
+# After 2 failures of the same tool, the handler returns {"fallback": true}
+# which the prompt's HUMAN HANDOFF rule converts into an automatic transfer.
+
+TOOL_FAILURE_THRESHOLD = 2
+
+
+def increment_tool_failure(call_sid: str, tool_name: str) -> int:
+    """Increment the system-failure count for a tool in this call. Returns new count."""
+    if call_sid not in _call_contexts:
+        return 0
+    failures = _call_contexts[call_sid].setdefault("tool_failures", {})
+    failures[tool_name] = failures.get(tool_name, 0) + 1
+    return failures[tool_name]
+
+
+def reset_tool_failure(call_sid: str, tool_name: str):
+    """Reset failure count for a tool (called on success)."""
+    if call_sid in _call_contexts:
+        failures = _call_contexts[call_sid].get("tool_failures", {})
+        failures.pop(tool_name, None)
+
+
+def should_escalate_after_failure(call_sid: str, tool_name: str) -> bool:
+    """Increment failure count and return True if threshold reached."""
+    return increment_tool_failure(call_sid, tool_name) >= TOOL_FAILURE_THRESHOLD
+
+
+def _build_error_with_tracking(call_sid: str, tool_name: str, fallback_msg: str) -> dict:
+    """Track this as a system failure. If the threshold is reached, return
+    fallback: True so the prompt's HUMAN HANDOFF rule auto-transfers the call.
+    Otherwise return the normal error message so the LLM can recover/retry."""
+    if call_sid and should_escalate_after_failure(call_sid, tool_name):
+        return {
+            "fallback": True,
+            "error": "repeated_failure",
+            "message": (
+                "I'm having repeated trouble with this. Let me get someone "
+                "from our team to help you right away."
+            ),
+        }
+    return {"error": fallback_msg}
+
+
+# ── In-flight Tool Task Tracking (disconnect resilience) ──
+# When the caller hangs up mid-tool-call (e.g. during create_booking's API
+# request), we need to wait for the request to complete before snapshotting
+# call state. Otherwise we get "ghost bookings" — the dashboard creates the
+# booking, but our call log shows info_only because mark_booking_complete
+# never fired before disconnect cancelled the handler.
+
+def add_inflight_task(call_sid: str, task: asyncio.Task):
+    """Register an in-flight tool task so the disconnect handler can await it."""
+    if call_sid not in _call_contexts:
+        return
+    inflight = _call_contexts[call_sid].setdefault("inflight_tasks", set())
+    inflight.add(task)
+
+
+def remove_inflight_task(call_sid: str, task: asyncio.Task):
+    """Remove a completed task from the in-flight set (called via done_callback)."""
+    if call_sid not in _call_contexts:
+        return
+    inflight = _call_contexts[call_sid].get("inflight_tasks", set())
+    inflight.discard(task)
+
+
+def get_inflight_tasks(call_sid: str) -> list:
+    """Return a snapshot of in-flight tool tasks for this call."""
+    if call_sid not in _call_contexts:
+        return []
+    return list(_call_contexts[call_sid].get("inflight_tasks", set()))
+
+
 async def handle_record_sms_consent(params: FunctionCallParams):
     """Record the caller's verbal SMS consent decision.
 
@@ -600,100 +677,140 @@ async def handle_create_booking(params: FunctionCallParams):
         "consentTextVersion": "v1",
     }
 
-    try:
-        async with aiohttp.ClientSession() as http:
-            resp = await http.post(
-                f"{DASHBOARD_URL}/api/agent/book",
-                json=payload,
-                headers=_agent_headers(config),
-                timeout=aiohttp.ClientTimeout(total=15),
-            )
+    # ── API call wrapped in an independent task ──
+    # If the caller hangs up mid-request, this task keeps running so:
+    # 1. The dashboard's response is still processed
+    # 2. mark_booking_complete fires (preventing "ghost bookings")
+    # 3. The call log records outcome="booked" instead of "info_only"
+    # The disconnect handler in bot.py awaits any in-flight tasks before
+    # snapshotting state.
 
-            if resp.status == 201:
-                data = await _safe_json(resp, "create-booking")
-                job_id = data.get("jobId", "confirmed")
-                label = "Dumpster rental" if is_dumpster else "Booking"
-                logger.info(f"{label} created: jobId={job_id} for {name} on {date} ({slot['period']} window)")
+    async def _do_booking_request():
+        try:
+            async with aiohttp.ClientSession() as http:
+                resp = await http.post(
+                    f"{DASHBOARD_URL}/api/agent/book",
+                    json=payload,
+                    headers=_agent_headers(config),
+                    timeout=aiohttp.ClientTimeout(total=15),
+                )
 
-                # Signal bot.py to start post-booking silence timer
-                ctx = _get_context()
-                if ctx.get("call_sid"):
-                    mark_booking_complete(ctx["call_sid"])
+                if resp.status == 201:
+                    # Mark IMMEDIATELY — before any further awaits — so the
+                    # disconnect handler always sees this booking, even if
+                    # subsequent JSON parsing or callback delivery is interrupted.
+                    if call_sid:
+                        mark_booking_complete(call_sid)
+                        reset_tool_failure(call_sid, "create_booking")
 
-                auto_booked = data.get("autoBooked", False)
+                    data = await _safe_json(resp, "create-booking")
+                    job_id = data.get("jobId", "confirmed")
+                    label = "Dumpster rental" if is_dumpster else "Booking"
+                    logger.info(f"{label} created: jobId={job_id} for {name} on {date} ({slot['period']} window)")
 
-                if is_swap:
-                    await params.result_callback({
-                        "success": True,
-                        "booking_id": str(job_id),
-                        "message": f"Dumpster swap scheduled for {date}, {slot['period']} window. We'll pick up the full container and drop off an empty one.",
-                    })
-                elif is_dumpster and auto_booked:
-                    size_label = f"{container_size}-yard" if container_size else ""
-                    await params.result_callback({
-                        "success": True,
-                        "autoBooked": True,
-                        "booking_id": str(job_id),
-                        "message": f"Dumpster rental CONFIRMED for {date}. {size_label} container, {rental_duration_days} day rental. Delivery is scheduled. Customer will receive a confirmation text and email with a link to their customer portal to add a card on file before delivery.",
-                    })
-                elif is_dumpster:
-                    size_label = f"{container_size}-yard" if container_size else ""
-                    await params.result_callback({
-                        "success": True,
-                        "autoBooked": False,
-                        "booking_id": str(job_id),
-                        "message": f"Dumpster rental request submitted for {date}. {size_label} container, {rental_duration_days} day rental. Our team will follow up to confirm availability and pricing.",
-                    })
-                else:
-                    await params.result_callback({
-                        "success": True,
-                        "booking_id": str(job_id),
-                        "message": f"Booking confirmed for {date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
-                    })
-            elif resp.status == 409:
-                # slot_full — the time slot filled between checking and booking
-                data = await _safe_json(resp, "create-booking-conflict")
-                available_slots = data.get("availableSlots", [])
-                if available_slots:
-                    def fmt_t(t: str) -> str:
-                        try:
-                            h = int(t.split(":")[0])
-                            if h == 0: return "12 AM"
-                            if h == 12: return "12 PM"
-                            return f"{h} AM" if h < 12 else f"{h - 12} PM"
-                        except (ValueError, IndexError):
-                            return t
-                    avail = [s for s in available_slots if s.get("available")]
-                    if avail:
-                        alt_strs = [f"{fmt_t(s['start'])} to {fmt_t(s['end'])}" for s in avail[:4]]
-                        await params.result_callback({
-                            "error": "slot_full",
-                            "message": f"That time slot just filled up. Available alternatives: {', '.join(alt_strs)}. Ask the caller which works.",
-                            "availableSlots": avail,
-                        })
+                    auto_booked = data.get("autoBooked", False)
+
+                    if is_swap:
+                        result = {
+                            "success": True,
+                            "booking_id": str(job_id),
+                            "message": f"Dumpster swap scheduled for {date}, {slot['period']} window. We'll pick up the full container and drop off an empty one.",
+                        }
+                    elif is_dumpster and auto_booked:
+                        size_label = f"{container_size}-yard" if container_size else ""
+                        result = {
+                            "success": True,
+                            "autoBooked": True,
+                            "booking_id": str(job_id),
+                            "message": f"Dumpster rental CONFIRMED for {date}. {size_label} container, {rental_duration_days} day rental. Delivery is scheduled. Customer will receive a confirmation text and email with a link to their customer portal to add a card on file before delivery.",
+                        }
+                    elif is_dumpster:
+                        size_label = f"{container_size}-yard" if container_size else ""
+                        result = {
+                            "success": True,
+                            "autoBooked": False,
+                            "booking_id": str(job_id),
+                            "message": f"Dumpster rental request submitted for {date}. {size_label} container, {rental_duration_days} day rental. Our team will follow up to confirm availability and pricing.",
+                        }
                     else:
-                        await params.result_callback({
+                        result = {
+                            "success": True,
+                            "booking_id": str(job_id),
+                            "message": f"Booking confirmed for {date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
+                        }
+                elif resp.status == 409:
+                    # slot_full — the time slot filled between checking and booking
+                    data = await _safe_json(resp, "create-booking-conflict")
+                    available_slots = data.get("availableSlots", [])
+                    if available_slots:
+                        def fmt_t(t: str) -> str:
+                            try:
+                                h = int(t.split(":")[0])
+                                if h == 0: return "12 AM"
+                                if h == 12: return "12 PM"
+                                return f"{h} AM" if h < 12 else f"{h - 12} PM"
+                            except (ValueError, IndexError):
+                                return t
+                        avail = [s for s in available_slots if s.get("available")]
+                        if avail:
+                            alt_strs = [f"{fmt_t(s['start'])} to {fmt_t(s['end'])}" for s in avail[:4]]
+                            result = {
+                                "error": "slot_full",
+                                "message": f"That time slot just filled up. Available alternatives: {', '.join(alt_strs)}. Ask the caller which works.",
+                                "availableSlots": avail,
+                            }
+                        else:
+                            result = {
+                                "error": "slot_full",
+                                "message": f"That time slot and all others on {date} are now full. Suggest a different date.",
+                                "availableSlots": [],
+                            }
+                    else:
+                        result = {
                             "error": "slot_full",
-                            "message": f"That time slot and all others on {date} are now full. Suggest a different date.",
-                            "availableSlots": [],
-                        })
+                            "message": "That time slot just filled up. Ask the caller for a different time.",
+                        }
                 else:
-                    await params.result_callback({
-                        "error": "slot_full",
-                        "message": "That time slot just filled up. Ask the caller for a different time.",
-                    })
-            else:
-                text = await resp.text()
-                logger.error(f"Booking API error: {resp.status} {text}")
-                await params.result_callback({
-                    "error": "I'm having trouble with our scheduling system. Let me take your info and have someone call you back."
-                })
+                    text = await resp.text()
+                    logger.error(f"Booking API error: {resp.status} {text}")
+                    result = _build_error_with_tracking(
+                        call_sid,
+                        "create_booking",
+                        "I'm having trouble with our scheduling system. Let me take your info and have someone call you back.",
+                    )
 
-    except Exception as e:
-        logger.error(f"Booking creation error: {e}")
-        await params.result_callback({
-            "error": "I'm having trouble creating the booking right now. Let me take your info and have someone call you back."
-        })
+                # Try to deliver result back to LLM — may no-op if the call ended
+                try:
+                    await params.result_callback(result)
+                except Exception as cb_err:
+                    logger.debug(f"Could not deliver booking result to LLM (call may have ended): {cb_err}")
+
+        except asyncio.CancelledError:
+            logger.info(f"Booking task cancelled for {call_sid}")
+            raise
+        except Exception as e:
+            logger.error(f"Booking creation error: {e}")
+            try:
+                await params.result_callback(_build_error_with_tracking(
+                    call_sid,
+                    "create_booking",
+                    "I'm having trouble creating the booking right now. Let me take your info and have someone call you back.",
+                ))
+            except Exception:
+                pass
+
+    # Spawn the booking request as an independent task and track it
+    api_task = asyncio.create_task(_do_booking_request())
+    if call_sid:
+        add_inflight_task(call_sid, api_task)
+        api_task.add_done_callback(lambda t, sid=call_sid: remove_inflight_task(sid, t))
+
+    # Wait for it (shielded so cancellation of THIS handler doesn't kill api_task)
+    try:
+        await asyncio.shield(api_task)
+    except asyncio.CancelledError:
+        logger.info(f"create_booking handler cancelled for {call_sid}; API task continues independently")
+        raise
 
 
 async def handle_lookup_appointment(params: FunctionCallParams):
@@ -721,6 +838,7 @@ async def handle_lookup_appointment(params: FunctionCallParams):
             )
 
             if resp.status == 200:
+                reset_tool_failure(ctx.get("call_sid", ""), "lookup_appointment")
                 data = await _safe_json(resp, "lookup-appointment")
                 if data.get("found"):
                     await params.result_callback({
@@ -734,14 +852,18 @@ async def handle_lookup_appointment(params: FunctionCallParams):
                         "message": "No appointments found for that number."
                     })
             else:
-                await params.result_callback({
-                    "error": "I'm having trouble looking that up. Can you give me your name instead?"
-                })
+                await params.result_callback(_build_error_with_tracking(
+                    ctx.get("call_sid", ""),
+                    "lookup_appointment",
+                    "I'm having trouble looking that up. Can you give me your name instead?",
+                ))
     except Exception as e:
         logger.error(f"Appointment lookup failed: {e}")
-        await params.result_callback({
-            "error": "I'm having trouble looking that up right now."
-        })
+        await params.result_callback(_build_error_with_tracking(
+            ctx.get("call_sid", ""),
+            "lookup_appointment",
+            "I'm having trouble looking that up right now.",
+        ))
 
 
 async def handle_reschedule_appointment(params: FunctionCallParams):
@@ -797,6 +919,7 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
             )
 
             if resp.status == 200:
+                reset_tool_failure(ctx.get("call_sid", ""), "reschedule_appointment")
                 await params.result_callback({
                     "success": True,
                     "message": f"Appointment rescheduled to {new_date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
@@ -805,10 +928,18 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
             else:
                 text = await resp.text()
                 logger.error(f"Reschedule API error: {resp.status} {text}")
-                await params.result_callback({"error": "Couldn't reschedule that appointment."})
+                await params.result_callback(_build_error_with_tracking(
+                    ctx.get("call_sid", ""),
+                    "reschedule_appointment",
+                    "Couldn't reschedule that appointment.",
+                ))
     except Exception as e:
         logger.error(f"Reschedule error: {e}")
-        await params.result_callback({"error": "I'm having trouble rescheduling right now."})
+        await params.result_callback(_build_error_with_tracking(
+            ctx.get("call_sid", ""),
+            "reschedule_appointment",
+            "I'm having trouble rescheduling right now.",
+        ))
 
 
 async def handle_cancel_appointment(params: FunctionCallParams):
@@ -838,16 +969,25 @@ async def handle_cancel_appointment(params: FunctionCallParams):
             )
 
             if resp.status == 200:
+                reset_tool_failure(ctx.get("call_sid", ""), "cancel_appointment")
                 await params.result_callback({
                     "success": True,
                     "message": "Appointment cancelled.",
                 })
                 logger.info(f"Cancelled appointment for {phone}, reason: {reason}")
             else:
-                await params.result_callback({"error": "Couldn't cancel that appointment."})
+                await params.result_callback(_build_error_with_tracking(
+                    ctx.get("call_sid", ""),
+                    "cancel_appointment",
+                    "Couldn't cancel that appointment.",
+                ))
     except Exception as e:
         logger.error(f"Cancel error: {e}")
-        await params.result_callback({"error": "I'm having trouble processing the cancellation."})
+        await params.result_callback(_build_error_with_tracking(
+            ctx.get("call_sid", ""),
+            "cancel_appointment",
+            "I'm having trouble processing the cancellation.",
+        ))
 
 
 # ── Address Verification ──────────────────────────────

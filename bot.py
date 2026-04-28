@@ -75,6 +75,7 @@ from agent.handlers import (
     has_sms_consent,
     send_automated_followup,
     log_call_to_dashboard,
+    get_inflight_tasks,
     _current_call_sid,
 )
 from agent.context import should_compress, compress_context
@@ -114,7 +115,7 @@ tools = ToolsSchema(standard_tools=[
             "date": {"type": "string", "description": "YYYY-MM-DD"},
             "time": {"type": "string", "description": "Time slot: use the start-end format from check_available_slots (e.g. '08:00-11:00'), or labels: morning, midday, afternoon"},
             "description": {"type": "string", "description": "Items for removal, project description for dumpster, or swap reason"},
-            "type": {"type": "string", "enum": ["pickup", "in_person_estimate", "dumpster_rental", "dumpster_swap"], "description": "Type of appointment. Use 'dumpster_rental' for new deliveries, 'dumpster_swap' for swapping a full container for an empty one."},
+            "type": {"type": "string", "enum": ["pickup", "dumpster_rental", "dumpster_swap"], "description": "Type of appointment. Use 'pickup' for all junk removal jobs (including when a caller asks for an estimate or someone to come look — every job is an on-site assessment + removal). Use 'dumpster_rental' for new deliveries, 'dumpster_swap' for swapping a full container for an empty one."},
             "container_size": {"type": "string", "enum": ["10", "15", "20", "30", "40"], "description": "Container size in cubic yards (for dumpster_rental or dumpster_swap)"},
             "rental_duration_days": {"type": "integer", "description": "Rental duration in days, default 7 (only for dumpster_rental)"},
             "promo_code": {"type": "string", "description": "Validated promo code to apply discount (optional)"},
@@ -355,18 +356,20 @@ async def run_bot(
     # Track background watcher tasks so we can cancel them on disconnect
     _timeout_task = None
     _booking_watcher_task = None
+    _pre_silence_watcher_task = None
 
     @transport.event_handler("on_client_connected")
     async def on_connected(transport, client):
-        nonlocal _timeout_task, _booking_watcher_task
+        nonlocal _timeout_task, _booking_watcher_task, _pre_silence_watcher_task
         logger.info(f"Call connected: {call_id} from {caller_number} → {company_name}")
 
         # Play greeting immediately via TTS frame
         await task.queue_frames([TTSSpeakFrame(text=greeting)])
 
-        # Start call duration timer and post-booking silence watcher
+        # Start call duration timer, post-booking silence watcher, and pre-booking silence watcher
         _timeout_task = asyncio.create_task(_call_timeout_watcher(task, context))
         _booking_watcher_task = asyncio.create_task(_post_booking_watcher(task, context, call_id))
+        _pre_silence_watcher_task = asyncio.create_task(_pre_booking_silence_watcher(task, context, call_id))
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(transport, client):
@@ -377,6 +380,24 @@ async def run_bot(
             _timeout_task.cancel()
         if _booking_watcher_task and not _booking_watcher_task.done():
             _booking_watcher_task.cancel()
+        if _pre_silence_watcher_task and not _pre_silence_watcher_task.done():
+            _pre_silence_watcher_task.cancel()
+
+        # Wait for any in-flight tool tasks (e.g. create_booking API request
+        # in mid-flight) before snapshotting state. Prevents "ghost bookings"
+        # where the dashboard creates the booking but the call log records
+        # outcome="info_only" because mark_booking_complete didn't fire in time.
+        inflight = get_inflight_tasks(call_id)
+        if inflight:
+            logger.info(f"Waiting up to 10s for {len(inflight)} in-flight tool task(s) before snapshotting {call_id}")
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*inflight, return_exceptions=True),
+                    timeout=10
+                )
+                logger.info(f"In-flight tasks completed for {call_id}")
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout waiting for in-flight tasks on {call_id} — snapshotting anyway")
 
         # Capture state BEFORE clearing context
         booked = is_booking_complete(call_id)
@@ -415,7 +436,27 @@ async def run_bot(
             summary = summary_resp.choices[0].message.content
         except Exception as e:
             logger.error(f"Summary generation failed: {e}")
-            summary = "Summary unavailable"
+            # Fallback: build a minimal transcript from the last 10 turns so the
+            # operator has SOME context instead of "Summary unavailable".
+            try:
+                transcript_parts = []
+                for m in context.messages[-10:]:
+                    role = m.get("role", "")
+                    if role not in ("user", "assistant"):
+                        continue
+                    content = str(m.get("content", "")).strip()[:80]
+                    if content:
+                        label = "Caller" if role == "user" else "Agent"
+                        transcript_parts.append(f"{label}: {content}")
+                transcript = " | ".join(transcript_parts)[:500]
+                summary = (
+                    f"AI summary unavailable. Recent transcript: {transcript}"
+                    if transcript
+                    else "Summary unavailable"
+                )
+            except Exception as fallback_err:
+                logger.error(f"Transcript fallback also failed: {fallback_err}")
+                summary = "Summary unavailable"
 
         logger.info(f"Call summary [{call_id}] ({duration_s}s): {summary}")
 
@@ -457,6 +498,58 @@ async def run_bot(
                 context.messages = await compress_context(context.messages, summary_client)
             except Exception as e:
                 logger.warning(f"Context compression failed (non-fatal): {e}")
+
+    # ── Pre-Booking Silence Watcher ────────────────────
+
+    async def _pre_booking_silence_watcher(task, context, cid: str):
+        """Catch callers who never speak after the greeting (butt-dial, technical
+        issues, hesitant callers). At 30s of silence, prompt once. At 45s, say a
+        graceful goodbye and end. Stops as soon as the caller speaks OR a booking
+        starts (post-booking watcher takes over)."""
+        INITIAL_PROMPT_AT_SECONDS = 30
+        GOODBYE_AT_SECONDS = 45
+
+        try:
+            # Capture the timestamp at watcher start. If it changes, caller spoke.
+            initial_timestamp = last_caller_speech_time
+            nudge_sent = False
+
+            while True:
+                await asyncio.sleep(3)
+
+                # If a booking has completed, the post-booking watcher handles it
+                if is_booking_complete(cid):
+                    return
+
+                # If the caller has spoken at any point, our job is done
+                if last_caller_speech_time != initial_timestamp:
+                    return
+
+                now = datetime.now(ZoneInfo(timezone))
+                elapsed = (now - initial_timestamp).total_seconds()
+
+                if elapsed >= INITIAL_PROMPT_AT_SECONDS and not nudge_sent:
+                    logger.info(f"Pre-booking silence at {INITIAL_PROMPT_AT_SECONDS}s for {cid} — sending nudge")
+                    context.messages.append({
+                        "role": "system",
+                        "content": "The caller hasn't said anything yet. Gently check in: 'Hello? Are you still there?'",
+                    })
+                    await task.queue_frames([LLMMessagesFrame(context.messages)])
+                    nudge_sent = True
+
+                if elapsed >= GOODBYE_AT_SECONDS:
+                    logger.info(f"Pre-booking silence at {GOODBYE_AT_SECONDS}s — ending call {cid}")
+                    context.messages.append({
+                        "role": "system",
+                        "content": "The caller still hasn't responded. Say briefly: 'Sounds like you might have called by mistake. Feel free to call us back anytime — have a great day!' Then stop talking.",
+                    })
+                    await task.queue_frames([LLMMessagesFrame(context.messages)])
+                    await asyncio.sleep(8)
+                    await task.cancel()
+                    return
+
+        except asyncio.CancelledError:
+            pass  # Call ended before silence watcher fired
 
     # ── Post-Booking Silence Watcher ───────────────────
 

@@ -651,18 +651,22 @@ async def handle_check_available_slots(params: FunctionCallParams):
                     "message": msg,
                 })
             else:
-                # API error — fall back to offering any time
+                logger.error(f"Available slots API error: {resp.status} {await resp.text()}")
                 await params.result_callback({
-                    "available": True,
+                    "available": False,
+                    "fallback": True,
+                    "error": "system_unavailable",
                     "slots": [],
-                    "message": "I couldn't check slot availability. Go ahead and offer their preferred time."
+                    "message": "I can't verify the schedule right now. Let me get someone from our team to help."
                 })
     except Exception as e:
         logger.error(f"Available slots check failed: {e}")
         await params.result_callback({
-            "available": True,
+            "available": False,
+            "fallback": True,
+            "error": "system_unavailable",
             "slots": [],
-            "message": "I couldn't check the schedule right now. Go ahead and offer their preferred time."
+            "message": "I can't verify the schedule right now. Let me get someone from our team to help."
         })
 
 
@@ -695,6 +699,7 @@ async def handle_create_booking(params: FunctionCallParams):
 
     is_dumpster = booking_type in ("dumpster_rental", "dumpster_swap")
     is_swap = booking_type == "dumpster_swap"
+    service_type = booking_type if is_dumpster else "junk_removal"
 
     # ── Validate date ──
     parsed_date = _validate_date(date)
@@ -748,7 +753,7 @@ async def handle_create_booking(params: FunctionCallParams):
         "timeSlot": slot["period"],  # "08:00-10:00" or "Morning"
         "notes": notes,
         "type": booking_type,
-        "serviceType": "dumpster_rental" if is_dumpster else "junk_removal",
+        "serviceType": service_type,
         "twilioCallSid": ctx.get("call_sid", ""),
     }
     if is_dumpster:
@@ -799,7 +804,7 @@ async def handle_create_booking(params: FunctionCallParams):
 
                     data = await _safe_json(resp, "create-booking")
                     job_id = data.get("jobId", "confirmed")
-                    label = "Dumpster rental" if is_dumpster else "Booking"
+                    label = "Dumpster swap" if is_swap else "Dumpster rental" if is_dumpster else "Booking"
                     logger.info(f"{label} created: jobId={job_id} for {name} on {date} ({slot['period']} window)")
 
                     auto_booked = data.get("autoBooked", False)
@@ -816,7 +821,7 @@ async def handle_create_booking(params: FunctionCallParams):
                             "success": True,
                             "autoBooked": True,
                             "booking_id": str(job_id),
-                            "message": f"Dumpster rental CONFIRMED for {date}. {size_label} container, {rental_duration_days} day rental. Delivery is scheduled. Customer will receive a confirmation text and email with a link to their customer portal to add a card on file before delivery.",
+                            "message": f"Dumpster rental CONFIRMED for {date}. {size_label} container, {rental_duration_days} day rental. Delivery is scheduled. If SMS consent was recorded earlier in the call, you may tell the caller they'll receive a confirmation text shortly. Do not promise an email unless the dashboard explicitly confirms one.",
                         }
                     elif is_dumpster:
                         size_label = f"{container_size}-yard" if container_size else ""
@@ -1636,7 +1641,7 @@ async def log_call_to_dashboard(
                 headers=_agent_headers(config),
                 timeout=aiohttp.ClientTimeout(total=10),
             )
-            if resp.status == 201:
+            if resp.status in (200, 201):
                 logger.info(f"Call log recorded: {twilio_call_sid} outcome={outcome}")
             else:
                 body = await resp.text()

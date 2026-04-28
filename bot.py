@@ -72,6 +72,7 @@ from agent.handlers import (
     clear_call_context,
     is_booking_complete,
     was_transfer_complete,
+    get_transfer_state,
     has_sms_consent,
     send_automated_followup,
     log_call_to_dashboard,
@@ -402,6 +403,7 @@ async def run_bot(
         # Capture state BEFORE clearing context
         booked = is_booking_complete(call_id)
         transferred = was_transfer_complete(call_id)
+        transfer_state = get_transfer_state(call_id)
         sms_consented = has_sms_consent(call_id)
         saved_caller = caller_number
         saved_config = dict(client_config)  # shallow copy
@@ -465,6 +467,8 @@ async def run_bot(
             outcome = "booked"
         elif transferred:
             outcome = "transferred"
+        elif transfer_state.get("callback_requested"):
+            outcome = "callback_requested"
         elif duration_s < 10:
             outcome = "voicemail"
         else:
@@ -480,6 +484,9 @@ async def run_bot(
             outcome=outcome,
             summary=summary or "",
             sms_consent=sms_consented,
+            transfer_reason=transfer_state.get("transfer_reason"),
+            transfer_status=transfer_state.get("transfer_status"),
+            callback_requested=transfer_state.get("callback_requested"),
         ))
 
         await task.cancel()

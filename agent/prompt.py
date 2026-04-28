@@ -152,16 +152,16 @@ WEBSITE MENTION (mention ONCE before starting the booking flow):
 
 SMS_SECTION = """
 SMS CONSENT (REQUIRED BEFORE ANY TEXTING):
-- Before mentioning, promising, or sending ANY text message, you MUST ask for explicit SMS consent.
-- Use this phrasing (adapt naturally): "Would it be okay if we sent you a text with [the information / a confirmation / a link to our website]?"
-- If the caller says YES: Call record_sms_consent with consented=true. You may now mention that texts will be sent.
+- Before mentioning or promising ANY text message, you MUST ask for explicit SMS consent.
+- For booking confirmations, use this phrasing naturally: "Would it be okay if we sent you a text confirmation?"
+- If the caller says YES: Call record_sms_consent with consented=true. You may now mention booking confirmation texts.
 - If the caller says NO: Call record_sms_consent with consented=false. Do NOT mention texting again for the rest of the call. Provide all information verbally.
 - NEVER say "we'll text you" or "you'll receive a text" BEFORE getting consent.
 - After a booking is confirmed:
   - If consent was given earlier: "You'll receive a confirmation text shortly."
   - If consent was NOT given or NOT yet asked: "You're all set! Your appointment is confirmed for [date/time]." Do NOT mention texts.
-- This consent rule applies to ALL texts: booking confirmations, follow-ups, and website links.
-- If you have not yet asked for SMS consent during this call, you MUST ask before any text-related action.
+- This consent rule applies to booking confirmation and follow-up texts.
+- If website-link texting is available, a separate website instruction appears earlier in the booking flow. Do not offer to text a website link unless that website instruction was provided.
 - PROACTIVE CONSENT BEFORE EVERY BOOKING: A booking confirmation text is sent automatically by the dashboard, but ONLY if consent was recorded with the booking. So BEFORE you call create_booking, if you have not yet asked for SMS consent during this call, ask: "Would it be okay if we sent you a text confirmation?" Then call record_sms_consent with their answer (true for yes, false for no). Only then proceed to create_booking. Reason: a customer who would have said yes won't get their confirmation text if you skip this step.
 """
 
@@ -283,14 +283,16 @@ def build_system_prompt(config: dict[str, Any]) -> str:
         )
         dumpster_scen = DUMPSTER_SCENARIOS
 
-    # Build SMS section (only if smsEnabled AND twilioNumber exist)
+    # Build SMS instructions. Booking-confirmation consent only requires SMS
+    # capability; website-link texting also requires a configured website URL.
     sms_enabled = config.get("smsEnabled", False)
     has_twilio_number = bool(config.get("twilioNumber"))
     has_website = bool(config.get("websiteUrl"))
     sms_section = ""
     website_upsell = ""
-    if sms_enabled and has_twilio_number and has_website:
+    if sms_enabled and has_twilio_number:
         sms_section = SMS_SECTION
+    if sms_enabled and has_twilio_number and has_website:
         website_upsell = WEBSITE_UPSELL
 
     return SYSTEM_PROMPT_TEMPLATE.format(
@@ -396,4 +398,3 @@ def _format_hour(hour: int) -> str:
         return "12:00 PM"
     else:
         return f"{hour - 12}:00 PM"
-

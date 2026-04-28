@@ -47,8 +47,9 @@ async def get_client_config(client_id: str) -> dict[str, Any]:
     logger.info(f"Cached config for {client_id} ({config.get('companyName', 'unknown')})")
 
     # Sanity-check critical fields and warn if missing.
-    # forwardingPhone is required for transfer_to_human to work — missing it means
-    # any caller asking for a manager will be silently dropped to voicemail.
+    # forwardingPhone is required for transfer_to_human to work. Missing it means
+    # callers asking for a human will fall back to a callback request instead of
+    # being transferred live.
     if not config.get("forwardingPhone"):
         logger.critical(
             f"forwardingPhone MISSING for client {client_id} "

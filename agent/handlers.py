@@ -79,12 +79,39 @@ def mark_transfer_complete(call_sid: str):
     """Flag that the call was transferred to a human."""
     if call_sid in _call_contexts:
         _call_contexts[call_sid]["transfer_complete"] = True
+        _call_contexts[call_sid]["transfer_status"] = "completed"
 
 
 def was_transfer_complete(call_sid: str) -> bool:
     """Check if a transfer was completed during this call."""
     ctx = _call_contexts.get(call_sid, {})
     return ctx.get("transfer_complete", False)
+
+
+def mark_transfer_state(
+    call_sid: str,
+    status: str,
+    reason: str | None = None,
+    callback_requested: bool = False,
+):
+    """Record structured human-handoff state for the final call log."""
+    if call_sid not in _call_contexts:
+        return
+    _call_contexts[call_sid]["transfer_status"] = status
+    if reason is not None:
+        _call_contexts[call_sid]["transfer_reason"] = reason
+    if callback_requested:
+        _call_contexts[call_sid]["callback_requested"] = True
+
+
+def get_transfer_state(call_sid: str) -> dict[str, Any]:
+    """Return structured human-handoff state captured during this call."""
+    ctx = _call_contexts.get(call_sid, {})
+    return {
+        "transfer_status": ctx.get("transfer_status"),
+        "transfer_reason": ctx.get("transfer_reason"),
+        "callback_requested": ctx.get("callback_requested", False),
+    }
 
 
 def mark_sms_consent(call_sid: str, consented: bool):
@@ -97,6 +124,73 @@ def has_sms_consent(call_sid: str) -> bool | None:
     """Check SMS consent status. Returns None if not yet asked."""
     ctx = _call_contexts.get(call_sid, {})
     return ctx.get("sms_consent", None)
+
+
+def _phone_lookup_key(phone: str) -> str:
+    """Use the last 10 digits as a stable per-call lookup cache key."""
+    digits = "".join(c for c in phone if c.isdigit())
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+def remember_lookup_results(call_sid: str, phone: str, jobs: list[dict[str, Any]]):
+    """Cache lookup results so mutations can avoid ambiguous phone-only updates."""
+    if call_sid not in _call_contexts:
+        return
+    key = _phone_lookup_key(phone)
+    if not key:
+        return
+    lookups = _call_contexts[call_sid].setdefault("appointment_lookups", {})
+    lookups[key] = jobs
+
+
+def get_cached_lookup_jobs(call_sid: str, phone: str) -> list[dict[str, Any]] | None:
+    """Return cached jobs for a phone, or None if lookup was not performed."""
+    ctx = _call_contexts.get(call_sid, {})
+    key = _phone_lookup_key(phone)
+    if not key:
+        return None
+    return ctx.get("appointment_lookups", {}).get(key)
+
+
+def resolve_job_id_from_lookup(
+    call_sid: str,
+    phone: str,
+    provided_job_id: str | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Require lookup-backed job selection before mutating existing bookings."""
+    if provided_job_id:
+        return provided_job_id, None
+
+    cached_jobs = get_cached_lookup_jobs(call_sid, phone)
+    if cached_jobs is None:
+        return None, {
+            "error": "lookup_required",
+            "message": (
+                "Look up the caller's appointments first, then confirm which "
+                "appointment they want to change before trying again."
+            ),
+        }
+
+    if len(cached_jobs) == 1:
+        job_id = cached_jobs[0].get("jobId") or cached_jobs[0].get("id")
+        if job_id:
+            return str(job_id), None
+
+    if len(cached_jobs) > 1:
+        return None, {
+            "error": "multiple_bookings_require_job_id",
+            "message": (
+                "I found multiple active bookings for this caller. Read back "
+                "the date and address for each one, ask which appointment they "
+                "mean, then call this tool again with the selected job_id."
+            ),
+            "jobs": cached_jobs,
+        }
+
+    return None, {
+        "error": "no_cached_booking",
+        "message": "No active appointment was found from the lookup. Do not change or cancel anything.",
+    }
 
 
 # ── Tool Failure Counter (per call, per tool) ──────────
@@ -841,12 +935,15 @@ async def handle_lookup_appointment(params: FunctionCallParams):
                 reset_tool_failure(ctx.get("call_sid", ""), "lookup_appointment")
                 data = await _safe_json(resp, "lookup-appointment")
                 if data.get("found"):
+                    jobs = data.get("jobs", [])
+                    remember_lookup_results(ctx.get("call_sid", ""), phone, jobs)
                     await params.result_callback({
                         "found": True,
                         "customer": data.get("customer", {}),
-                        "jobs": data.get("jobs", []),
+                        "jobs": jobs,
                     })
                 else:
+                    remember_lookup_results(ctx.get("call_sid", ""), phone, [])
                     await params.result_callback({
                         "found": False,
                         "message": "No appointments found for that number."
@@ -900,17 +997,25 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
         })
         return
 
+    call_sid = ctx.get("call_sid", "")
+    job_id, selection_error = resolve_job_id_from_lookup(
+        call_sid,
+        phone,
+        params.arguments.get("job_id"),
+    )
+    if selection_error:
+        await params.result_callback(selection_error)
+        return
+
     try:
         async with aiohttp.ClientSession() as http:
-            job_id = params.arguments.get("job_id")
             payload = {
                     "phone": phone,
                     "newDate": new_date,
                     "newTime": slot["start"],
                     "timeSlot": slot["period"],
                 }
-            if job_id:
-                payload["jobId"] = job_id
+            payload["jobId"] = job_id
             resp = await http.post(
                 f"{DASHBOARD_URL}/api/agent/reschedule",
                 json=payload,
@@ -949,18 +1054,31 @@ async def handle_cancel_appointment(params: FunctionCallParams):
     """
     config = _get_config()
     ctx = _get_context()
-    phone = params.arguments.get("phone", ctx.get("caller_number", ""))
+    raw_phone = params.arguments.get("phone", "")
+    import re
+    if re.search(r"\d{7,}", re.sub(r"[\s\-\(\)\+]", "", raw_phone)):
+        phone = raw_phone
+    else:
+        phone = ctx.get("caller_number", raw_phone)
     reason = params.arguments.get("reason", "Customer requested cancellation")
+
+    call_sid = ctx.get("call_sid", "")
+    job_id, selection_error = resolve_job_id_from_lookup(
+        call_sid,
+        phone,
+        params.arguments.get("job_id"),
+    )
+    if selection_error:
+        await params.result_callback(selection_error)
+        return
 
     try:
         async with aiohttp.ClientSession() as http:
-            job_id = params.arguments.get("job_id")
             payload = {
                     "phone": phone,
                     "reason": reason,
                 }
-            if job_id:
-                payload["jobId"] = job_id
+            payload["jobId"] = job_id
             resp = await http.post(
                 f"{DASHBOARD_URL}/api/agent/cancel",
                 json=payload,
@@ -1092,10 +1210,19 @@ async def handle_transfer_to_human(params: FunctionCallParams):
     reason = params.arguments.get("reason", "Caller requested human agent")
     call_sid = ctx.get("call_sid")
     forwarding_phone = config.get("forwardingPhone", "")
+    if call_sid:
+        mark_transfer_state(call_sid, "requested", reason)
 
     # No forwarding number configured — take a message instead
     if not forwarding_phone:
         logger.warning(f"No forwardingPhone configured — cannot transfer call {call_sid}")
+        if call_sid:
+            mark_transfer_state(
+                call_sid,
+                "unavailable_no_forwarding_phone",
+                reason,
+                callback_requested=True,
+            )
         await params.result_callback({
             "transferred": False,
             "message": (
@@ -1134,14 +1261,15 @@ async def handle_transfer_to_human(params: FunctionCallParams):
 
         logger.info(f"Call {call_sid} transferred to {forwarding_phone} (reason: {reason})")
 
+        # Flag transfer before callback delivery; the media stream may end as
+        # soon as Twilio accepts the redirect.
+        if ctx.get("call_sid"):
+            mark_transfer_complete(ctx["call_sid"])
+
         await params.result_callback({
             "transferred": True,
             "message": "Transferring the call now.",
         })
-
-        # Flag transfer in per-call context for call-log outcome
-        if ctx.get("call_sid"):
-            mark_transfer_complete(ctx["call_sid"])
 
         # Cancel the AI pipeline — the call audio stream will end
         pipeline_task = ctx.get("pipeline_task")
@@ -1151,6 +1279,8 @@ async def handle_transfer_to_human(params: FunctionCallParams):
 
     except Exception as e:
         logger.error(f"Transfer failed for call {call_sid}: {e}")
+        if call_sid:
+            mark_transfer_state(call_sid, "failed", reason, callback_requested=True)
         await params.result_callback({
             "transferred": False,
             "message": "I'm having trouble with the transfer right now. Let me take your info and have someone call you back within the hour.",
@@ -1471,6 +1601,9 @@ async def log_call_to_dashboard(
     summary: str = "",
     appointment_date: str = "",
     sms_consent: bool | None = None,
+    transfer_reason: str | None = None,
+    transfer_status: str | None = None,
+    callback_requested: bool | None = None,
 ) -> None:
     """Fire-and-forget POST to dashboard call log endpoint."""
     try:
@@ -1489,6 +1622,12 @@ async def log_call_to_dashboard(
         # Include SMS consent decision for audit trail
         if sms_consent is not None:
             payload["smsConsent"] = sms_consent
+        if transfer_reason:
+            payload["transferReason"] = transfer_reason
+        if transfer_status:
+            payload["transferStatus"] = transfer_status
+        if callback_requested is not None:
+            payload["callbackRequested"] = callback_requested
 
         async with aiohttp.ClientSession() as http:
             resp = await http.post(

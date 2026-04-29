@@ -9,6 +9,7 @@ ENDPOINT MAPPING (dashboard ↔ phone agent):
   - lookup_appointment    → GET  /api/agent/lookup            (X-AGENT-SECRET auth)
   - reschedule            → POST /api/agent/reschedule        (X-AGENT-SECRET auth)
   - cancel                → POST /api/agent/cancel            (X-AGENT-SECRET auth)
+  - schedule_callback     → POST /api/agent/schedule-callback (X-AGENT-SECRET auth)
   - transfer_to_human     → Twilio REST API (call redirect)
   - validate_promo_code   → GET  /api/promo/validate          (x-api-key + x-site-token)
 """
@@ -104,13 +105,30 @@ def mark_transfer_state(
         _call_contexts[call_sid]["callback_requested"] = True
 
 
+def mark_callback_requested(
+    call_sid: str,
+    due_at: str | None = None,
+    reason: str | None = None,
+):
+    """Record scheduled callback state for the final call log."""
+    if call_sid not in _call_contexts:
+        return
+    _call_contexts[call_sid]["callback_requested"] = True
+    if due_at:
+        _call_contexts[call_sid]["callback_due_at"] = due_at
+    if reason:
+        _call_contexts[call_sid]["callback_reason"] = reason
+
+
 def get_transfer_state(call_sid: str) -> dict[str, Any]:
-    """Return structured human-handoff state captured during this call."""
+    """Return structured human-handoff and callback state captured during this call."""
     ctx = _call_contexts.get(call_sid, {})
     return {
         "transfer_status": ctx.get("transfer_status"),
         "transfer_reason": ctx.get("transfer_reason"),
         "callback_requested": ctx.get("callback_requested", False),
+        "callback_due_at": ctx.get("callback_due_at"),
+        "callback_reason": ctx.get("callback_reason"),
     }
 
 
@@ -238,6 +256,15 @@ def _build_error_with_tracking(call_sid: str, tool_name: str, fallback_msg: str)
             ),
         }
     return {"error": fallback_msg}
+
+
+def _build_immediate_fallback(error: str, message: str) -> dict:
+    """Return a tool result that prompts an immediate human handoff."""
+    return {
+        "fallback": True,
+        "error": error,
+        "message": message,
+    }
 
 
 # ── In-flight Tool Task Tracking (disconnect resilience) ──
@@ -1199,6 +1226,147 @@ def _get_twilio_client():
     return _twilio_client
 
 
+# ── Scheduled Callbacks ────────────────────────────────
+
+async def handle_schedule_callback(params: FunctionCallParams):
+    """Schedule a human callback through the dashboard.
+
+    Dashboard: POST /api/agent/schedule-callback with X-AGENT-SECRET auth.
+    """
+    config = _get_config()
+    ctx = _get_context()
+    call_sid = ctx.get("call_sid", "")
+
+    requested_time = (
+        params.arguments.get("requested_time")
+        or params.arguments.get("requestedTime")
+        or params.arguments.get("callback_due_at")
+        or params.arguments.get("callbackDueAt")
+        or ""
+    )
+    requested_time = str(requested_time).strip()
+    reason = str(params.arguments.get("reason") or "Caller requested a scheduled callback").strip()
+    caller_phone = (
+        params.arguments.get("caller_phone")
+        or params.arguments.get("callerPhone")
+        or ctx.get("caller_number", "")
+        or ""
+    )
+    caller_phone = str(caller_phone).strip()
+    caller_name = (
+        params.arguments.get("caller_name")
+        or params.arguments.get("callerName")
+        or ""
+    )
+    caller_name = str(caller_name).strip()
+
+    async def _deliver_result(result: dict[str, Any]):
+        try:
+            await params.result_callback(result)
+        except Exception as cb_err:
+            logger.debug(f"Could not deliver schedule_callback result to LLM (call may have ended): {cb_err}")
+
+    if not requested_time:
+        await _deliver_result({
+            "error": "requested_time_required",
+            "message": "Ask the caller for the exact date and time they want someone to call them back.",
+        })
+        return
+
+    if "T" not in requested_time:
+        await _deliver_result({
+            "error": "requested_time_must_include_time",
+            "message": "The callback time needs both a date and time. Ask the caller for an exact callback time, then use YYYY-MM-DDTHH:MM:SS.",
+        })
+        return
+
+    if not caller_phone:
+        await _deliver_result({
+            "error": "caller_phone_required",
+            "message": "Confirm the best phone number for the callback, then try again.",
+        })
+        return
+
+    payload: dict[str, Any] = {
+        "callerPhone": caller_phone,
+        "requestedTime": requested_time,
+        "reason": reason,
+    }
+    if call_sid:
+        payload["twilioCallSid"] = call_sid
+    if caller_name:
+        payload["callerName"] = caller_name
+
+    async def _do_schedule_callback_request():
+        try:
+            async with aiohttp.ClientSession() as http:
+                resp = await http.post(
+                    f"{DASHBOARD_URL}/api/agent/schedule-callback",
+                    json=payload,
+                    headers=_agent_headers(config),
+                    timeout=aiohttp.ClientTimeout(total=15),
+                )
+
+                if resp.status in (200, 201):
+                    if call_sid:
+                        mark_callback_requested(call_sid, requested_time, reason)
+                        reset_tool_failure(call_sid, "schedule_callback")
+
+                    data = await _safe_json(resp, "schedule-callback")
+                    callback_due_at = data.get("callbackDueAt") or requested_time
+                    if call_sid:
+                        mark_callback_requested(call_sid, str(callback_due_at), reason)
+
+                    await _deliver_result({
+                        "success": True,
+                        "callbackDueAt": callback_due_at,
+                        "phoneCallId": data.get("phoneCallId"),
+                        "callbackTaskId": data.get("callbackTaskId"),
+                        "message": "Callback scheduled. You may now tell the caller someone from the team will call them back at the confirmed time.",
+                    })
+                    return
+
+                data = await _safe_json(resp, "schedule-callback-error")
+                message = data.get("error") or data.get("message") or "That callback time is not available."
+                if resp.status in (400, 422):
+                    await _deliver_result({
+                        "error": "invalid_callback_time",
+                        "message": f"{message} Ask the caller for another time during business hours.",
+                    })
+                    return
+
+                logger.error(f"Schedule callback API error: {resp.status} {data}")
+                if call_sid:
+                    increment_tool_failure(call_sid, "schedule_callback")
+                await _deliver_result(_build_immediate_fallback(
+                    "schedule_callback_unavailable",
+                    "I'm having trouble scheduling that callback right now. Let me get someone from our team to help.",
+                ))
+
+        except asyncio.CancelledError:
+            logger.info(f"Schedule callback task cancelled for {call_sid}")
+            raise
+        except Exception as e:
+            logger.error(f"Schedule callback error: {e}")
+            if call_sid:
+                increment_tool_failure(call_sid, "schedule_callback")
+            await _deliver_result(_build_immediate_fallback(
+                "schedule_callback_unavailable",
+                "I'm having trouble scheduling that callback right now. Let me get someone from our team to help.",
+            ))
+
+    api_task = asyncio.create_task(_do_schedule_callback_request())
+    if call_sid:
+        add_inflight_task(call_sid, api_task)
+        api_task.add_done_callback(lambda t, sid=call_sid: remove_inflight_task(sid, t))
+
+    try:
+        await asyncio.shield(api_task)
+    except asyncio.CancelledError:
+        logger.info(f"schedule_callback handler cancelled for {call_sid}; API task continues independently")
+        raise
+
+
 # ── Human Handoff ──────────────────────────────────────
 
 async def handle_transfer_to_human(params: FunctionCallParams):
@@ -1609,6 +1777,7 @@ async def log_call_to_dashboard(
     transfer_reason: str | None = None,
     transfer_status: str | None = None,
     callback_requested: bool | None = None,
+    callback_due_at: str | None = None,
 ) -> None:
     """Fire-and-forget POST to dashboard call log endpoint."""
     try:
@@ -1633,6 +1802,8 @@ async def log_call_to_dashboard(
             payload["transferStatus"] = transfer_status
         if callback_requested is not None:
             payload["callbackRequested"] = callback_requested
+        if callback_due_at:
+            payload["callbackDueAt"] = callback_due_at
 
         async with aiohttp.ClientSession() as http:
             resp = await http.post(

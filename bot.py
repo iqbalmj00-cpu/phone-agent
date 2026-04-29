@@ -63,6 +63,7 @@ from agent.handlers import (
     handle_lookup_appointment,
     handle_reschedule_appointment,
     handle_cancel_appointment,
+    handle_schedule_callback,
     handle_transfer_to_human,
     handle_validate_promo_code,
     handle_record_sms_consent,
@@ -85,6 +86,7 @@ from agent.context import should_compress, compress_context
 # ── Automated Follow-Up SMS ─────────────────────────────
 
 FOLLOWUP_DELAY_SECONDS = 300  # 5 minutes
+INFLIGHT_TASK_WAIT_SECONDS = 17  # Covers 15s dashboard tool calls plus small scheduling overhead
 
 async def _delayed_followup_sms(caller_number: str, config: dict, delay_seconds: int = FOLLOWUP_DELAY_SECONDS):
     """Wait, then send automated follow-up SMS to callers who didn't book."""
@@ -164,6 +166,17 @@ tools = ToolsSchema(standard_tools=[
             "job_id": {"type": "string", "description": "Job ID from lookup_appointment to target a specific booking (required when customer has multiple bookings)"},
         },
         required=["phone"],
+    ),
+    FunctionSchema(
+        name="schedule_callback",
+        description="Schedule a human follow-up callback at a specific date and time. Use only after the caller asks for a callback and confirms the exact callback time.",
+        properties={
+            "requested_time": {"type": "string", "description": "Exact callback date and time in YYYY-MM-DDTHH:MM:SS format, resolved from relative wording in the client's timezone"},
+            "reason": {"type": "string", "description": "Why the caller wants a callback"},
+            "caller_phone": {"type": "string", "description": "Best phone number for the callback. Optional if the caller confirms the number they called from is best."},
+            "caller_name": {"type": "string", "description": "Caller name, if known"},
+        },
+        required=["requested_time", "reason"],
     ),
     FunctionSchema(
         name="transfer_to_human",
@@ -315,6 +328,9 @@ async def run_bot(
         "cancel_appointment", handle_cancel_appointment, cancel_on_interruption=False
     )
     llm.register_function(
+        "schedule_callback", handle_schedule_callback, cancel_on_interruption=False
+    )
+    llm.register_function(
         "transfer_to_human", handle_transfer_to_human, cancel_on_interruption=False
     )
     llm.register_function("validate_promo_code", handle_validate_promo_code)
@@ -390,11 +406,11 @@ async def run_bot(
         # outcome="info_only" because mark_booking_complete didn't fire in time.
         inflight = get_inflight_tasks(call_id)
         if inflight:
-            logger.info(f"Waiting up to 10s for {len(inflight)} in-flight tool task(s) before snapshotting {call_id}")
+            logger.info(f"Waiting up to {INFLIGHT_TASK_WAIT_SECONDS}s for {len(inflight)} in-flight tool task(s) before snapshotting {call_id}")
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*inflight, return_exceptions=True),
-                    timeout=10
+                    timeout=INFLIGHT_TASK_WAIT_SECONDS
                 )
                 logger.info(f"In-flight tasks completed for {call_id}")
             except asyncio.TimeoutError:
@@ -487,6 +503,7 @@ async def run_bot(
             transfer_reason=transfer_state.get("transfer_reason"),
             transfer_status=transfer_state.get("transfer_status"),
             callback_requested=transfer_state.get("callback_requested"),
+            callback_due_at=transfer_state.get("callback_due_at"),
         ))
 
         await task.cancel()

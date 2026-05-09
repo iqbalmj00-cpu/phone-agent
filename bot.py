@@ -513,30 +513,36 @@ async def run_bot(
         call_end_time = datetime.now(ZoneInfo(timezone))
         duration_s = int((call_end_time - call_start_time).total_seconds())
 
+        transcript_messages = [
+            m for m in context.messages
+            if m.get("role") in ("user", "assistant") and str(m.get("content", "")).strip()
+        ]
+
         try:
-            summary_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-            summary_resp = await summary_client.chat.completions.create(
-                model=UTILITY_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Summarize this phone call in one sentence. Include the outcome (inquiry, booked, rescheduled, cancelled, or escalation).",
-                    },
-                    *context.messages[-10:],
-                ],
-                max_tokens=100,
-            )
-            summary = summary_resp.choices[0].message.content
+            if not transcript_messages:
+                summary = "No caller conversation captured. Caller disconnected before a real exchange was recorded."
+            else:
+                summary_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+                summary_resp = await summary_client.chat.completions.create(
+                    model=UTILITY_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Summarize this phone call in one sentence using only the caller and agent transcript provided. Do not infer that a booking, cancellation, reschedule, or transfer happened unless it is explicitly present in the transcript.",
+                        },
+                        *transcript_messages[-10:],
+                    ],
+                    max_tokens=100,
+                )
+                summary = summary_resp.choices[0].message.content
         except Exception as e:
             logger.error(f"Summary generation failed: {e}")
-            # Fallback: build a minimal transcript from the last 10 turns so the
-            # operator has SOME context instead of "Summary unavailable".
+            # Fallback: build a minimal transcript from the last 10 real turns so
+            # the operator has SOME context instead of "Summary unavailable".
             try:
                 transcript_parts = []
-                for m in context.messages[-10:]:
+                for m in transcript_messages[-10:]:
                     role = m.get("role", "")
-                    if role not in ("user", "assistant"):
-                        continue
                     content = str(m.get("content", "")).strip()[:80]
                     if content:
                         label = "Caller" if role == "user" else "Agent"

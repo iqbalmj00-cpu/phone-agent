@@ -31,10 +31,19 @@ class CartesiaContinuationTTS(CartesiaTTSService):
         self._max_buffer_delay_ms = max_buffer_delay_ms
 
     def _build_msg(
-        self, text: str = "", continue_transcript: bool = True, add_timestamps: bool = True
+        self,
+        text: str = "",
+        continue_transcript: bool = True,
+        add_timestamps: bool = True,
+        context_id: str = "",
     ):
         # Get the base JSON string from parent
-        msg_str = super()._build_msg(text, continue_transcript, add_timestamps)
+        msg_str = super()._build_msg(
+            text=text,
+            continue_transcript=continue_transcript,
+            add_timestamps=add_timestamps,
+            context_id=context_id,
+        )
         # Parse, inject max_buffer_delay_ms, re-serialize
         msg = json.loads(msg_str)
         msg["max_buffer_delay_ms"] = self._max_buffer_delay_ms

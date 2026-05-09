@@ -13,15 +13,29 @@ import asyncio
 import json
 import os
 from datetime import datetime
+from xml.sax.saxutils import escape, quoteattr
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
 from loguru import logger
 
-from config import HOST, PORT, MAX_CONCURRENT_CALLS, TWILIO_ACCOUNT_SID
+from config import (
+    HOST,
+    PORT,
+    MAX_CONCURRENT_CALLS,
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN,
+    OPENAI_API_KEY,
+    CARTESIA_API_KEY,
+    DASHBOARD_URL,
+    INGEST_API_KEY,
+    PLATFORM_API_KEY,
+    GOOGLE_MAPS_API_KEY,
+)
 from client_config import get_client_config
 from bot import run_bot
+from agent.handlers import process_transfer_status_callback
 
 app = FastAPI(title="ScaleYourJunk Phone Agent")
 
@@ -42,6 +56,42 @@ async def startup():
 async def health():
     """Health check for Fly.io."""
     return JSONResponse({"status": "ok", "active_calls": len(_active_calls)})
+
+
+@app.get("/ready")
+async def ready():
+    """Readiness check: verifies required env var names are configured."""
+    required = {
+        "OPENAI_API_KEY": OPENAI_API_KEY,
+        "CARTESIA_API_KEY": CARTESIA_API_KEY,
+        "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
+        "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
+        "DASHBOARD_URL": DASHBOARD_URL,
+        "INGEST_API_KEY": INGEST_API_KEY,
+        "PLATFORM_API_KEY": PLATFORM_API_KEY,
+    }
+    missing = [name for name, value in required.items() if not value]
+    degraded = []
+    if not GOOGLE_MAPS_API_KEY:
+        degraded.append("GOOGLE_MAPS_API_KEY")
+
+    status_code = 503 if missing else 200
+    return JSONResponse(
+        {
+            "status": "not_ready" if missing else "ready",
+            "active_calls": len(_active_calls),
+            "missing": missing,
+            "degraded": degraded,
+        },
+        status_code=status_code,
+    )
+
+
+def _public_base_url(request: Request) -> str:
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "localhost")
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    scheme = "https" if proto == "https" or "fly.dev" in host else "http"
+    return f"{scheme}://{host}"
 
 
 def _is_within_business_hours(config: dict) -> bool:
@@ -118,9 +168,9 @@ async def twiml_webhook(client_id: str, request: Request):
         closed_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="Polly.Joanna">
-        Thanks for calling {company}.
+        Thanks for calling {escape(str(company))}.
         Our office is currently closed.
-        Our hours are {days_label}, {hours_label}.
+        Our hours are {escape(str(days_label))}, {escape(str(hours_label))}.
         Please call back during business hours,
         or visit our website to book a pickup online.
         Thank you, and have a great day!
@@ -136,7 +186,7 @@ async def twiml_webhook(client_id: str, request: Request):
             busy_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="Polly.Joanna">
-        Thanks for calling {company}.
+        Thanks for calling {escape(str(company))}.
         We're experiencing high call volume right now.
         Please try again in a few minutes, or visit our website to book online.
         Thank you!
@@ -148,17 +198,39 @@ async def twiml_webhook(client_id: str, request: Request):
     host = request.headers.get("host", "localhost")
     scheme = "wss" if request.url.scheme == "https" or "fly.dev" in host else "ws"
     ws_url = f"{scheme}://{host}/ws/{client_id}"
+    phone_agent_base_url = _public_base_url(request)
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="{ws_url}">
-            <Parameter name="client_id" value="{client_id}" />
-            <Parameter name="From" value="{from_number}" />
+        <Stream url={quoteattr(ws_url)}>
+            <Parameter name="client_id" value={quoteattr(client_id)} />
+            <Parameter name="From" value={quoteattr(str(from_number))} />
+            <Parameter name="phoneAgentBaseUrl" value={quoteattr(phone_agent_base_url)} />
         </Stream>
     </Connect>
 </Response>"""
 
+    return PlainTextResponse(content=twiml, media_type="application/xml")
+
+
+@app.post("/transfer-status/{client_id}/{call_sid}")
+async def transfer_status_webhook(client_id: str, call_sid: str, request: Request):
+    """Twilio <Dial action> callback used to record real handoff result."""
+    form_data = await request.form()
+    dial_status = str(form_data.get("DialCallStatus", "") or "")
+    dial_call_sid = str(form_data.get("DialCallSid", "") or "")
+    dial_duration = form_data.get("DialCallDuration", 0)
+    logger.info(
+        f"Transfer status callback: client={client_id} call={call_sid} "
+        f"dial_status={dial_status or 'missing'}"
+    )
+    twiml = await process_transfer_status_callback(
+        call_sid=call_sid,
+        dial_status=dial_status,
+        dial_call_sid=dial_call_sid,
+        dial_duration=dial_duration,
+    )
     return PlainTextResponse(content=twiml, media_type="application/xml")
 
 
@@ -170,6 +242,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     stream_id = None
     call_id = None
     caller_number = ""
+    phone_agent_base_url = ""
 
     try:
         # ── Parse initial Twilio messages to get stream metadata ──
@@ -185,13 +258,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 start_data = msg.get("start", {})
                 stream_id = start_data.get("streamSid", "")
                 call_id = start_data.get("callSid", "")
-                caller_number = start_data.get("customParameters", {}).get(
+                custom_params = start_data.get("customParameters", {})
+                caller_number = custom_params.get(
                     "callerNumber", ""
                 )
                 if not caller_number:
-                    caller_number = start_data.get("customParameters", {}).get(
+                    caller_number = custom_params.get(
                         "From", ""
                     )
+                phone_agent_base_url = custom_params.get("phoneAgentBaseUrl", "")
                 logger.info(
                     f"Stream started: stream={stream_id} call={call_id} "
                     f"from={caller_number} client={client_id}"
@@ -218,6 +293,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         # ── Fetch client config ──
         try:
             client_config = await get_client_config(client_id)
+            client_config = dict(client_config)
+            client_config["_clientId"] = client_id
+            client_config["_phoneAgentBaseUrl"] = phone_agent_base_url
         except Exception as e:
             logger.error(f"Failed to load config for {client_id}: {e}")
             async with _calls_lock:

@@ -6,6 +6,8 @@ to keep token usage stable (~2K tokens) regardless of call length.
 
 from loguru import logger
 
+from config import UTILITY_MODEL
+
 
 MAX_FULL_TURNS = 10  # Keep this many recent turns verbatim
 RECAP_REFRESH_INTERVAL = 5  # Re-summarize every N turns after threshold
@@ -53,7 +55,7 @@ async def compress_context(messages: list[dict], llm_client) -> list[dict]:
 
     try:
         response = await llm_client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model=UTILITY_MODEL,
             messages=[{"role": "user", "content": recap_prompt}],
             max_tokens=200,
         )

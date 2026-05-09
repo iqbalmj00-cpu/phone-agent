@@ -15,12 +15,10 @@ load_dotenv(override=True)
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 
-# ── Deepgram ────────────────────────────────────────────
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
-
 # ── OpenAI ──────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-LLM_MODEL = "gpt-4.1-mini"
+REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
+UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-4.1-mini")
 
 # ── Cartesia ────────────────────────────────────────────
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")

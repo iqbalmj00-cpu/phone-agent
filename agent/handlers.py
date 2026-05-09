@@ -17,9 +17,12 @@ ENDPOINT MAPPING (dashboard ↔ phone agent):
 import asyncio
 import contextvars
 import json
+import re
 import aiohttp
 from datetime import datetime, timedelta
 from typing import Any
+from urllib.parse import quote
+from xml.sax.saxutils import escape, quoteattr
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -30,6 +33,12 @@ from config import DASHBOARD_URL, INGEST_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUT
 # ── Per-call context — keyed by call_sid for concurrency safety ──
 _call_contexts: dict[str, dict[str, Any]] = {}
 _current_call_sid: contextvars.ContextVar[str] = contextvars.ContextVar("current_call_sid", default="")
+
+# Twilio <Dial action> callbacks arrive after the media stream has ended, so
+# transfer state must outlive the normal per-call context.
+_pending_transfers: dict[str, dict[str, Any]] = {}
+_TRANSFER_SUCCESS_STATUSES = {"completed", "answered"}
+_TRANSFER_FAILURE_STATUSES = {"busy", "no-answer", "failed", "canceled"}
 
 
 def set_call_context(call_sid: str, caller_number: str, client_config: dict[str, Any]):
@@ -46,10 +55,13 @@ def clear_call_context(call_sid: str):
     _call_contexts.pop(call_sid, None)
 
 
-def mark_booking_complete(call_sid: str):
+def mark_booking_complete(call_sid: str, details: dict[str, Any] | None = None):
     """Flag that a booking was successfully created for this call."""
     if call_sid in _call_contexts:
         _call_contexts[call_sid]["booking_complete"] = True
+        if details:
+            current = _call_contexts[call_sid].setdefault("booking_details", {})
+            current.update({k: v for k, v in details.items() if v is not None})
 
 
 def set_pipeline_task(call_sid: str, task):
@@ -62,6 +74,12 @@ def is_booking_complete(call_sid: str) -> bool:
     """Check if a booking has been completed during this call."""
     ctx = _call_contexts.get(call_sid, {})
     return ctx.get("booking_complete", False)
+
+
+def get_booking_log_state(call_sid: str) -> dict[str, Any]:
+    """Return structured booking fields supported by the dashboard call log."""
+    ctx = _call_contexts.get(call_sid, {})
+    return dict(ctx.get("booking_details", {}))
 
 
 def mark_sms_sent(call_sid: str):
@@ -130,6 +148,86 @@ def get_transfer_state(call_sid: str) -> dict[str, Any]:
         "callback_due_at": ctx.get("callback_due_at"),
         "callback_reason": ctx.get("callback_reason"),
     }
+
+
+def _remember_pending_transfer(
+    call_sid: str,
+    config: dict[str, Any],
+    from_number: str,
+    reason: str,
+):
+    """Keep enough context to update the dashboard when Twilio reports Dial status."""
+    _pending_transfers[call_sid] = {
+        "config": dict(config),
+        "from_number": from_number,
+        "to_number": config.get("twilioNumber", ""),
+        "reason": reason,
+        "transfer_status": "requested",
+        "duration": 0,
+        "summary": "",
+        "sms_consent": None,
+        "callback_requested": False,
+        "callback_due_at": None,
+        "caller_name": None,
+        "appointment_date": None,
+    }
+
+
+def _update_pending_transfer_status(
+    call_sid: str,
+    status: str,
+    *,
+    callback_requested: bool = False,
+):
+    pending = _pending_transfers.get(call_sid)
+    if not pending:
+        return
+    pending["transfer_status"] = status
+    if callback_requested:
+        pending["callback_requested"] = True
+
+
+def update_pending_transfer_snapshot(
+    call_sid: str,
+    *,
+    duration: int,
+    summary: str,
+    from_number: str,
+    to_number: str,
+    config: dict[str, Any],
+    sms_consent: bool | None,
+    callback_requested: bool,
+    callback_due_at: str | None = None,
+    caller_name: str | None = None,
+    appointment_date: str | None = None,
+):
+    """Refresh pending transfer metadata before final call-log write."""
+    pending = _pending_transfers.get(call_sid)
+    if not pending:
+        return
+    pending.update({
+        "duration": max(0, int(duration)),
+        "summary": summary,
+        "from_number": from_number,
+        "to_number": to_number,
+        "config": dict(config),
+        "sms_consent": sms_consent,
+        "callback_requested": bool(callback_requested),
+        "callback_due_at": callback_due_at,
+        "caller_name": caller_name,
+        "appointment_date": appointment_date,
+    })
+
+
+def get_pending_transfer_state(call_sid: str) -> dict[str, Any]:
+    pending = _pending_transfers.get(call_sid)
+    return dict(pending) if pending else {}
+
+
+def clear_pending_transfer_if_terminal(call_sid: str):
+    pending = _pending_transfers.get(call_sid)
+    if pending and pending.get("terminal_logged"):
+        _pending_transfers.pop(call_sid, None)
 
 
 def mark_sms_consent(call_sid: str, consented: bool):
@@ -209,6 +307,152 @@ def resolve_job_id_from_lookup(
         "error": "no_cached_booking",
         "message": "No active appointment was found from the lookup. Do not change or cancel anything.",
     }
+
+
+def _normalize_address_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def remember_address_verification(
+    call_sid: str,
+    raw_address: str,
+    formatted_address: str,
+    service_area_status: str,
+    reason: str,
+):
+    """Cache address verification so create_booking can block clear out-of-area jobs."""
+    if call_sid not in _call_contexts:
+        return
+    verifications = _call_contexts[call_sid].setdefault("address_verifications", {})
+    record = {
+        "raw_address": raw_address,
+        "formatted_address": formatted_address,
+        "service_area_status": service_area_status,
+        "reason": reason,
+    }
+    for key_source in (raw_address, formatted_address):
+        key = _normalize_address_key(key_source)
+        if key:
+            verifications[key] = record
+
+
+def get_address_verification(call_sid: str, address: str) -> dict[str, Any] | None:
+    """Find the verification result that matches the booking address."""
+    ctx = _call_contexts.get(call_sid, {})
+    verifications = ctx.get("address_verifications", {})
+    if not verifications:
+        return None
+    key = _normalize_address_key(address)
+    if key in verifications:
+        return verifications[key]
+
+    matches = []
+    for stored_key, record in verifications.items():
+        if key and (key in stored_key or stored_key in key):
+            matches.append(record)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _component_long_short(result: dict[str, Any], component_type: str) -> tuple[str, str]:
+    for component in result.get("address_components", []):
+        if component_type in component.get("types", []):
+            return component.get("long_name", ""), component.get("short_name", "")
+    return "", ""
+
+
+def _extract_geocode_components(result: dict[str, Any]) -> dict[str, str]:
+    city = (
+        _component_long_short(result, "locality")[0]
+        or _component_long_short(result, "postal_town")[0]
+        or _component_long_short(result, "sublocality")[0]
+        or _component_long_short(result, "administrative_area_level_3")[0]
+    )
+    state_long, state_short = _component_long_short(result, "administrative_area_level_1")
+    county = _component_long_short(result, "administrative_area_level_2")[0]
+    postal_code = _component_long_short(result, "postal_code")[0]
+    return {
+        "city": city,
+        "state": state_short or state_long,
+        "state_long": state_long,
+        "county": county,
+        "postal_code": postal_code,
+    }
+
+
+def _normalize_place(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+_US_STATE_TO_ABBR = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar",
+    "california": "ca", "colorado": "co", "connecticut": "ct", "delaware": "de",
+    "florida": "fl", "georgia": "ga", "hawaii": "hi", "idaho": "id",
+    "illinois": "il", "indiana": "in", "iowa": "ia", "kansas": "ks",
+    "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md",
+    "massachusetts": "ma", "michigan": "mi", "minnesota": "mn", "mississippi": "ms",
+    "missouri": "mo", "montana": "mt", "nebraska": "ne", "nevada": "nv",
+    "new hampshire": "nh", "new jersey": "nj", "new mexico": "nm", "new york": "ny",
+    "north carolina": "nc", "north dakota": "nd", "ohio": "oh", "oklahoma": "ok",
+    "oregon": "or", "pennsylvania": "pa", "rhode island": "ri", "south carolina": "sc",
+    "south dakota": "sd", "tennessee": "tn", "texas": "tx", "utah": "ut",
+    "vermont": "vt", "virginia": "va", "washington": "wa", "west virginia": "wv",
+    "wisconsin": "wi", "wyoming": "wy",
+}
+
+
+def _state_variants(value: str) -> set[str]:
+    norm = _normalize_place(value)
+    if not norm:
+        return set()
+    variants = {norm}
+    if norm in _US_STATE_TO_ABBR:
+        variants.add(_US_STATE_TO_ABBR[norm])
+    for long_name, abbr in _US_STATE_TO_ABBR.items():
+        if norm == abbr:
+            variants.add(long_name)
+    return variants
+
+
+def _service_area_tokens(config: dict[str, Any]) -> list[str]:
+    raw = str(config.get("serviceArea") or "")
+    parts = re.split(r"[,;\n|/]+", raw)
+    tokens = [_normalize_place(p) for p in parts]
+    city = _normalize_place(str(config.get("city") or ""))
+    if city:
+        tokens.append(city)
+    return [t for t in tokens if len(t) >= 3 and t not in {"area", "service area", "near me"}]
+
+
+def _assess_service_area(components: dict[str, str], config: dict[str, Any]) -> tuple[str, str]:
+    """Conservative area check: only block addresses that are clearly outside."""
+    address_city = _normalize_place(components.get("city", ""))
+    address_county = _normalize_place(components.get("county", ""))
+    address_states = _state_variants(components.get("state", "")) | _state_variants(components.get("state_long", ""))
+    configured_states = _state_variants(str(config.get("state") or ""))
+    service_area_text = _normalize_place(str(config.get("serviceArea") or ""))
+    tokens = _service_area_tokens(config)
+
+    if configured_states and address_states and configured_states.isdisjoint(address_states):
+        return "out_of_area", f"address state {components.get('state')} does not match configured state {config.get('state')}"
+
+    if address_city and address_city in tokens:
+        return "in_area", "address city matches configured service area"
+    if address_county and address_county in tokens:
+        return "in_area", "address county matches configured service area"
+
+    broad_terms = {"metro", "area", "surrounding", "nearby", "county", "counties", "greater", "region"}
+    has_broad_term = any(term in service_area_text.split() for term in broad_terms)
+    has_explicit_list = bool(re.search(r"[,;\n|/]", str(config.get("serviceArea") or "")))
+    city_like_tokens = [t for t in tokens if t and t not in configured_states]
+
+    if address_city and has_explicit_list and len(city_like_tokens) >= 2 and not has_broad_term:
+        return "out_of_area", "address city is not in the configured explicit service-area list"
+
+    if address_city or address_states:
+        return "uncertain", "address verified, but service-area text is not strict enough to prove coverage"
+    return "unknown", "address components did not include enough location detail for service-area checking"
 
 
 # ── Tool Failure Counter (per call, per tool) ──────────
@@ -525,7 +769,7 @@ async def handle_check_container_availability(params: FunctionCallParams):
                             msg += f" for that date. Next available: {next_date_str}."
                         else:
                             msg += ", and no other sizes in stock right now."
-                        msg += " Offer to submit a request."
+                        msg += " Do not create a booking or request unless the caller chooses an available size or date. Offer to transfer to the team if they need help."
                         await params.result_callback({
                             "available": False,
                             "alternativeSizes": [],
@@ -615,7 +859,8 @@ async def handle_check_available_slots(params: FunctionCallParams):
     """Check available time slots for a specific date.
 
     Calls GET /api/public/available-slots?date=YYYY-MM-DD
-    Returns human-readable list of available/full time windows.
+    Returns human-readable business-hour booking windows. This is not a
+    junk-removal job capacity check.
     """
     config = _get_config()
     date = params.arguments["date"]
@@ -668,9 +913,9 @@ async def handle_check_available_slots(params: FunctionCallParams):
                     msg = f"Available times on {date}: {', '.join(time_strs)}."
                     if full:
                         full_strs = [f"{fmt_time(s['start'])} to {fmt_time(s['end'])}" for s in full]
-                        msg += f" Fully booked: {', '.join(full_strs)}."
+                        msg += f" Not available: {', '.join(full_strs)}."
                 else:
-                    msg = f"All time slots are fully booked on {date}. Suggest a different date."
+                    msg = f"No booking windows are available on {date}. Suggest a different date."
 
                 await params.result_callback({
                     "available": len(available) > 0,
@@ -723,6 +968,7 @@ async def handle_create_booking(params: FunctionCallParams):
     booking_type = params.arguments.get("type", "pickup")
     container_size = params.arguments.get("container_size")
     rental_duration_days = params.arguments.get("rental_duration_days", 7)
+    call_sid = ctx.get("call_sid", "")
 
     is_dumpster = booking_type in ("dumpster_rental", "dumpster_swap")
     is_swap = booking_type == "dumpster_swap"
@@ -755,6 +1001,18 @@ async def handle_create_booking(params: FunctionCallParams):
         })
         return
 
+    address_verification = get_address_verification(call_sid, address) if call_sid else None
+    if address_verification and address_verification.get("service_area_status") == "out_of_area":
+        await params.result_callback({
+            "fallback": True,
+            "error": "outside_service_area",
+            "message": (
+                "That address appears to be outside the configured service area. "
+                "Do not create the booking. Let me connect the caller with the team to confirm coverage."
+            ),
+        })
+        return
+
     # ── Build notes ──
     if is_swap:
         size_str = f"{container_size}-yard" if container_size else "current size"
@@ -766,17 +1024,13 @@ async def handle_create_booking(params: FunctionCallParams):
         notes = f"Junk Removal Pickup: {description}"
 
     # ── Create booking via /api/agent/book ──
-    company_name = config.get("companyName", "the company")
-    tz = config.get("timezone", "America/Chicago")
-    tz_offset = datetime.now(ZoneInfo(tz)).strftime("%z")
-    # Format offset as -06:00 (insert colon)
-    tz_offset_formatted = f"{tz_offset[:3]}:{tz_offset[3:]}" if len(tz_offset) == 5 else tz_offset
+    local_datetime = f"{date}T{slot['start']}:00"
 
     payload = {
         "customerName": name,
         "customerPhone": phone,
         "address": address,
-        "date": f"{date}T{slot['start']}:00{tz_offset_formatted}",
+        "date": local_datetime,
         "timeSlot": slot["period"],  # "08:00-10:00" or "Morning"
         "notes": notes,
         "type": booking_type,
@@ -794,7 +1048,6 @@ async def handle_create_booking(params: FunctionCallParams):
     # ── Include SMS consent in booking payload ──
     # Critical: dashboard sends confirmation SMS immediately on booking creation.
     # Consent must arrive WITH the booking, not after-the-fact in the call-log.
-    call_sid = ctx.get("call_sid", "")
     consent_value = has_sms_consent(call_sid) if call_sid else None
     payload["smsConsent"] = {
         "optedIn": consent_value if consent_value is not None else False,
@@ -826,7 +1079,10 @@ async def handle_create_booking(params: FunctionCallParams):
                     # disconnect handler always sees this booking, even if
                     # subsequent JSON parsing or callback delivery is interrupted.
                     if call_sid:
-                        mark_booking_complete(call_sid)
+                        mark_booking_complete(call_sid, {
+                            "caller_name": name,
+                            "appointment_date": local_datetime,
+                        })
                         reset_tool_failure(call_sid, "create_booking")
 
                     data = await _safe_json(resp, "create-booking")
@@ -1148,6 +1404,9 @@ async def handle_verify_address(params: FunctionCallParams):
     Returns the top formatted address result so the agent can read it back
     and confirm with the caller before booking.
     """
+    config = _get_config()
+    ctx = _get_context()
+    call_sid = ctx.get("call_sid", "")
     address = params.arguments.get("address", "")
     if not address:
         await params.result_callback({
@@ -1178,10 +1437,39 @@ async def handle_verify_address(params: FunctionCallParams):
             if formatted:
                 # Strip ", USA" or ", US" suffix for cleaner readback
                 formatted = formatted.replace(", USA", "").replace(", US", "")
+                components = _extract_geocode_components(result)
+                area_status, area_reason = _assess_service_area(components, config)
+                if call_sid:
+                    remember_address_verification(
+                        call_sid,
+                        address,
+                        formatted,
+                        area_status,
+                        area_reason,
+                    )
+
+                if area_status == "out_of_area":
+                    message = (
+                        f"Verified address: {formatted}. This appears to be outside the configured service area. "
+                        "Do not book it automatically; offer to transfer the caller to the team to confirm coverage."
+                    )
+                elif area_status == "uncertain":
+                    message = (
+                        f"Verified address: {formatted}. Read this back to the caller and ask if it's correct. "
+                        "Service-area coverage is not fully proven from the configured area text, so transfer if the caller asks whether that location is covered."
+                    )
+                else:
+                    message = f"Verified address: {formatted}. Read this back to the caller and ask if it's correct."
+
                 await params.result_callback({
                     "verified": True,
                     "formatted_address": formatted,
-                    "message": f"Verified address: {formatted}. Read this back to the caller and ask if it's correct."
+                    "city": components.get("city"),
+                    "state": components.get("state"),
+                    "postal_code": components.get("postal_code"),
+                    "service_area_status": area_status,
+                    "service_area_reason": area_reason,
+                    "message": message,
                 })
                 return
 
@@ -1416,11 +1704,43 @@ async def handle_transfer_to_human(params: FunctionCallParams):
 
     # Build TwiML to redirect the call
     company_name = config.get("companyName", "our team")
+    base_url = str(config.get("_phoneAgentBaseUrl") or "").rstrip("/")
+    client_id = str(config.get("_clientId") or "unknown")
+    action_url = ""
+    if base_url:
+        action_url = (
+            f"{base_url}/transfer-status/"
+            f"{quote(client_id, safe='')}/{quote(call_sid, safe='')}"
+        )
+    else:
+        logger.warning(f"No phone-agent public base URL available for transfer status callback on call {call_sid}")
+
+    dial_attrs = ['timeout="25"']
+    twilio_number = config.get("twilioNumber", "")
+    if twilio_number:
+        dial_attrs.append(f"callerId={quoteattr(str(twilio_number))}")
+    if action_url:
+        dial_attrs.append(f"action={quoteattr(action_url)}")
+        dial_attrs.append('method="POST"')
+    dial_attr_str = " ".join(dial_attrs)
+    if call_sid:
+        _remember_pending_transfer(
+            call_sid,
+            config,
+            ctx.get("caller_number", ""),
+            reason,
+        )
+
+    post_dial_fallback = (
+        ""
+        if action_url
+        else '<Say voice="Polly.Joanna">We were unable to reach anyone at this time. We have marked this for a callback. Goodbye.</Say>'
+    )
     transfer_twiml = (
         f'<Response>'
-        f'<Say voice="Polly.Joanna">Please hold while we connect you with {company_name}.</Say>'
-        f'<Dial callerId="{config.get("twilioNumber", "")}">{forwarding_phone}</Dial>'
-        f'<Say voice="Polly.Joanna">We were unable to reach anyone at this time. Please try again later. Goodbye.</Say>'
+        f'<Say voice="Polly.Joanna">Please hold while we connect you with {escape(str(company_name))}.</Say>'
+        f'<Dial {dial_attr_str}>{escape(str(forwarding_phone))}</Dial>'
+        f'{post_dial_fallback}'
         f'</Response>'
     )
 
@@ -1434,13 +1754,15 @@ async def handle_transfer_to_human(params: FunctionCallParams):
 
         logger.info(f"Call {call_sid} transferred to {forwarding_phone} (reason: {reason})")
 
-        # Flag transfer before callback delivery; the media stream may end as
-        # soon as Twilio accepts the redirect.
+        # Twilio accepting the redirect only means dialing started. The final
+        # completed/failed state comes later from the <Dial action> callback.
         if ctx.get("call_sid"):
-            mark_transfer_complete(ctx["call_sid"])
+            mark_transfer_state(ctx["call_sid"], "dialing", reason)
+            _update_pending_transfer_status(ctx["call_sid"], "dialing")
 
         await params.result_callback({
             "transferred": True,
+            "transferStatus": "dialing",
             "message": "Transferring the call now.",
         })
 
@@ -1454,6 +1776,7 @@ async def handle_transfer_to_human(params: FunctionCallParams):
         logger.error(f"Transfer failed for call {call_sid}: {e}")
         if call_sid:
             mark_transfer_state(call_sid, "failed", reason, callback_requested=True)
+            _update_pending_transfer_status(call_sid, "failed", callback_requested=True)
         await params.result_callback({
             "transferred": False,
             "message": "I'm having trouble with the transfer right now. Let me take your info and have someone call you back within the hour.",
@@ -1772,14 +2095,15 @@ async def log_call_to_dashboard(
     duration: int,
     outcome: str,
     summary: str = "",
+    caller_name: str = "",
     appointment_date: str = "",
     sms_consent: bool | None = None,
     transfer_reason: str | None = None,
     transfer_status: str | None = None,
     callback_requested: bool | None = None,
     callback_due_at: str | None = None,
-) -> None:
-    """Fire-and-forget POST to dashboard call log endpoint."""
+) -> bool:
+    """POST to dashboard call log endpoint. Returns True when accepted."""
     try:
         payload: dict[str, Any] = {
             "twilioCallSid": twilio_call_sid,
@@ -1789,6 +2113,8 @@ async def log_call_to_dashboard(
         }
         if to_number:
             payload["toNumber"] = to_number
+        if caller_name:
+            payload["callerName"] = caller_name
         if summary:
             payload["summary"] = summary
         if appointment_date:
@@ -1814,8 +2140,124 @@ async def log_call_to_dashboard(
             )
             if resp.status in (200, 201):
                 logger.info(f"Call log recorded: {twilio_call_sid} outcome={outcome}")
+                return True
             else:
                 body = await resp.text()
                 logger.warning(f"Call log failed ({resp.status}): {body[:200]}")
+                return False
     except Exception as e:
         logger.error(f"Call log POST error: {e}")
+        return False
+
+
+def _parse_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+async def process_transfer_status_callback(
+    call_sid: str,
+    dial_status: str,
+    dial_call_sid: str = "",
+    dial_duration: str | int | None = None,
+) -> str:
+    """Handle Twilio <Dial action> status and update the dashboard call log."""
+    status = (dial_status or "").strip().lower()
+    pending = _pending_transfers.get(call_sid)
+
+    if status in _TRANSFER_SUCCESS_STATUSES:
+        transfer_status = "completed"
+        outcome = "transferred"
+        callback_requested = False
+    elif status in _TRANSFER_FAILURE_STATUSES:
+        transfer_status = "failed"
+        outcome = "callback_requested"
+        callback_requested = True
+    else:
+        transfer_status = "failed"
+        outcome = "callback_requested"
+        callback_requested = True
+        logger.warning(f"Unknown DialCallStatus for {call_sid}: {dial_status!r}")
+
+    if call_sid in _call_contexts:
+        mark_transfer_state(
+            call_sid,
+            transfer_status,
+            pending.get("reason") if pending else None,
+            callback_requested=callback_requested,
+        )
+        if transfer_status == "completed":
+            mark_transfer_complete(call_sid)
+
+    _update_pending_transfer_status(
+        call_sid,
+        transfer_status,
+        callback_requested=callback_requested,
+    )
+
+    if not pending:
+        logger.warning(f"Transfer status callback received without pending context for {call_sid}")
+        if callback_requested:
+            return (
+                '<Response><Say voice="Polly.Joanna">'
+                "We were not able to reach anyone right now. Please try again later. Goodbye."
+                "</Say><Hangup/></Response>"
+            )
+        return "<Response><Hangup/></Response>"
+
+    base_duration = _parse_int(pending.get("duration"), 0)
+    dial_seconds = _parse_int(dial_duration, 0)
+    duration = max(base_duration, base_duration + max(dial_seconds, 0))
+    reason = pending.get("reason") or "Caller requested human handoff"
+    summary_base = (pending.get("summary") or "").strip()
+    if transfer_status == "completed":
+        summary = (
+            f"{summary_base} Transfer completed to human."
+            if summary_base
+            else f"Caller requested human handoff ({reason}); transfer completed."
+        )
+    else:
+        summary = (
+            f"{summary_base} Transfer failed or was not answered; callback needed."
+            if summary_base
+            else f"Caller requested human handoff ({reason}); transfer failed or was not answered, so callback is needed."
+        )
+
+    await log_call_to_dashboard(
+        config=pending.get("config", {}),
+        twilio_call_sid=call_sid,
+        from_number=pending.get("from_number", ""),
+        to_number=pending.get("to_number", ""),
+        duration=duration,
+        outcome=outcome,
+        summary=summary,
+        caller_name=pending.get("caller_name") or "",
+        appointment_date=pending.get("appointment_date") or "",
+        sms_consent=pending.get("sms_consent"),
+        transfer_reason=reason,
+        transfer_status=transfer_status,
+        callback_requested=callback_requested,
+        callback_due_at=pending.get("callback_due_at"),
+    )
+
+    logger.info(
+        f"Transfer status recorded for {call_sid}: "
+        f"status={transfer_status} dial_status={status or 'missing'} dial_call_sid={dial_call_sid or 'missing'}"
+    )
+    pending["terminal_logged"] = True
+    pending["transfer_status"] = transfer_status
+    pending["callback_requested"] = callback_requested
+    pending["duration"] = duration
+    pending["summary"] = summary
+    if call_sid not in _call_contexts:
+        _pending_transfers.pop(call_sid, None)
+
+    if callback_requested:
+        return (
+            '<Response><Say voice="Polly.Joanna">'
+            "We were not able to reach anyone right now. We have marked this for a callback. Goodbye."
+            "</Say><Hangup/></Response>"
+        )
+    return "<Response><Hangup/></Response>"

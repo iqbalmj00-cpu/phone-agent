@@ -1,7 +1,7 @@
 """ScaleYourJunk Multi-Tenant AI Phone Agent — Pipecat Pipeline.
 
 Builds and runs the full voice agent pipeline per call:
-  Twilio audio in → Deepgram STT → GPT-4.1 Mini (tools) → Cartesia TTS → Twilio audio out
+  Twilio audio in → GPT Realtime 2 (tools + text output) → Cartesia TTS → Twilio audio out
 
 Each call gets its own pipeline with the client's config (agent name, voice,
 company name, hours, etc.) loaded dynamically from the dashboard.
@@ -20,24 +20,36 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import openai
-from deepgram import LiveOptions
 from loguru import logger
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMMessagesFrame, TTSSpeakFrame
+from pipecat.frames.frames import (
+    Frame,
+    LLMMessagesAppendFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
+    TranscriptionFrame,
+    TTSSpeakFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.realtime.events import (
+    AudioConfiguration,
+    AudioInput,
+    InputAudioTranscription,
+    PCMAudioFormat,
+    SemanticTurnDetection,
+    SessionProperties,
+)
+from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
     FastAPIWebsocketParams,
 )
 from pipecat.serializers.twilio import TwilioFrameSerializer
-from pipecat.processors.aggregators.openai_llm_context import (
-    OpenAILLMContext,
-)
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.processors.aggregators.sentence import SentenceAggregator
@@ -45,12 +57,12 @@ from pipecat.processors.aggregators.sentence import SentenceAggregator
 from agent.prosody import CartesiaContinuationTTS, ProsodyProcessor
 
 from config import (
-    DEEPGRAM_API_KEY,
     OPENAI_API_KEY,
     CARTESIA_API_KEY,
     DEFAULT_CARTESIA_VOICE_ID,
     CARTESIA_MODEL,
-    LLM_MODEL,
+    REALTIME_MODEL,
+    UTILITY_MODEL,
     MAX_CALL_DURATION_SECONDS,
     TWILIO_ACCOUNT_SID,
     TWILIO_AUTH_TOKEN,
@@ -74,10 +86,14 @@ from agent.handlers import (
     is_booking_complete,
     was_transfer_complete,
     get_transfer_state,
+    get_booking_log_state,
     has_sms_consent,
     send_automated_followup,
     log_call_to_dashboard,
     get_inflight_tasks,
+    update_pending_transfer_snapshot,
+    get_pending_transfer_state,
+    clear_pending_transfer_if_terminal,
     _current_call_sid,
 )
 from agent.context import should_compress, compress_context
@@ -87,6 +103,7 @@ from agent.context import should_compress, compress_context
 
 FOLLOWUP_DELAY_SECONDS = 300  # 5 minutes
 INFLIGHT_TASK_WAIT_SECONDS = 17  # Covers 15s dashboard tool calls plus small scheduling overhead
+CALL_LOG_WAIT_SECONDS = 12
 
 async def _delayed_followup_sms(caller_number: str, config: dict, delay_seconds: int = FOLLOWUP_DELAY_SECONDS):
     """Wait, then send automated follow-up SMS to callers who didn't book."""
@@ -103,6 +120,44 @@ async def _delayed_followup_sms(caller_number: str, config: dict, delay_seconds:
         logger.debug(f"Follow-up SMS cancelled for {caller_number}")
     except Exception as e:
         logger.error(f"Follow-up SMS error for {caller_number}: {e}")
+
+
+class RealtimeTranscriptTracker(FrameProcessor):
+    """Capture Realtime transcripts/text for call summaries and silence timers."""
+
+    def __init__(self, *, on_user_transcript, on_assistant_text, **kwargs):
+        super().__init__(**kwargs)
+        self._on_user_transcript = on_user_transcript
+        self._on_assistant_text = on_assistant_text
+        self._assistant_parts: list[str] = []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame) and frame.text:
+            self._on_user_transcript(frame.text)
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            self._assistant_parts = []
+        elif isinstance(frame, LLMTextFrame) and frame.text:
+            self._assistant_parts.append(frame.text)
+        elif isinstance(frame, LLMFullResponseEndFrame) and self._assistant_parts:
+            text = "".join(self._assistant_parts).strip()
+            self._assistant_parts = []
+            if text:
+                self._on_assistant_text(text)
+
+        await self.push_frame(frame, direction)
+
+
+async def _queue_context_instruction(task: PipelineTask, context: LLMContext, content: str) -> None:
+    """Append a system instruction and trigger one LLM response.
+
+    Realtime sessions already maintain their own context, so append only the new
+    instruction instead of resending the full local transcript.
+    """
+    message = {"role": "system", "content": content}
+    context.add_message(message)
+    await task.queue_frames([LLMMessagesAppendFrame([message], run_llm=True)])
 
 
 # ── Tool Definitions ────────────────────────────────────
@@ -196,7 +251,7 @@ tools = ToolsSchema(standard_tools=[
     ),
     FunctionSchema(
         name="check_available_slots",
-        description="Check which time slots are available for a specific date. Call this BEFORE offering times to the caller. Returns available and fully-booked time windows with capacity info.",
+        description="Check which business-hour booking windows are available for a specific date. Call this BEFORE offering times to the caller. This is not a junk-removal job capacity check.",
         properties={
             "date": {"type": "string", "description": "Date in YYYY-MM-DD format to check availability for"},
         },
@@ -252,40 +307,46 @@ async def run_bot(
         websocket=websocket_client,
         params=FastAPIWebsocketParams(
             audio_in_enabled=True,
-            audio_in_sample_rate=8000,
+            audio_in_sample_rate=24000,
+            audio_in_passthrough=True,
             audio_out_enabled=True,
             audio_out_sample_rate=8000,
-            vad_enabled=True,
-            vad_audio_passthrough=True,
-            vad_analyzer=SileroVADAnalyzer(),
             serializer=TwilioFrameSerializer(
                 stream_sid=stream_id,
                 call_sid=call_id,
                 account_sid=TWILIO_ACCOUNT_SID,
                 auth_token=TWILIO_AUTH_TOKEN,
+                params=TwilioFrameSerializer.InputParams(sample_rate=24000),
             ),
         ),
     )
 
-    # ── STT ─────────────────────────────────────────────
-    stt = DeepgramSTTService(
-        api_key=DEEPGRAM_API_KEY,
-        live_options=LiveOptions(
-            model="nova-3-general",
-            language="en-US",
-            smart_format=True,
-            encoding="linear16",
-            sample_rate=8000,
-            channels=1,
-        ),
-    )
-
-    # ── LLM ─────────────────────────────────────────────
-    llm = OpenAILLMService(
+    # ── Realtime LLM (audio understanding + reasoning + tools) ───────
+    llm = OpenAIRealtimeLLMService(
         api_key=OPENAI_API_KEY,
-        model=LLM_MODEL,
-        params=OpenAILLMService.InputParams(
-            temperature=0.7,
+        settings=OpenAIRealtimeLLMService.Settings(
+            model=REALTIME_MODEL,
+            system_instruction=build_system_prompt(client_config),
+            session_properties=SessionProperties(
+                output_modalities=["text"],
+                audio=AudioConfiguration(
+                    input=AudioInput(
+                        format=PCMAudioFormat(),
+                        transcription=InputAudioTranscription(
+                            model="gpt-4o-transcribe",
+                            language="en",
+                        ),
+                        turn_detection=SemanticTurnDetection(
+                            eagerness="medium",
+                            create_response=True,
+                            interrupt_response=True,
+                        ),
+                    ),
+                ),
+                tools=tools,
+                tool_choice="auto",
+                max_output_tokens=4096,
+            ),
         ),
     )
 
@@ -306,8 +367,36 @@ async def run_bot(
     system_prompt = build_system_prompt(client_config)
     messages = [{"role": "system", "content": system_prompt}]
 
-    context = OpenAILLMContext(messages=messages, tools=tools)
-    context_aggregator = llm.create_context_aggregator(context)
+    context = LLMContext(messages=messages, tools=tools)
+
+    async def maybe_compress_context():
+        if should_compress(context.messages):
+            try:
+                summary_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+                context.set_messages(await compress_context(context.messages, summary_client))
+            except Exception as e:
+                logger.warning(f"Context compression failed (non-fatal): {e}")
+
+    def record_user_transcript(text: str):
+        nonlocal last_caller_speech_time
+        last_caller_speech_time = datetime.now(ZoneInfo(timezone))
+        context.add_message({"role": "user", "content": text})
+        asyncio.create_task(maybe_compress_context())
+
+    def record_assistant_text(text: str):
+        context.add_message({"role": "assistant", "content": text})
+        asyncio.create_task(maybe_compress_context())
+
+    user_transcript_tracker = RealtimeTranscriptTracker(
+        name="RealtimeUserTranscriptTracker",
+        on_user_transcript=record_user_transcript,
+        on_assistant_text=lambda _text: None,
+    )
+    assistant_text_tracker = RealtimeTranscriptTracker(
+        name="RealtimeAssistantTextTracker",
+        on_user_transcript=lambda _text: None,
+        on_assistant_text=record_assistant_text,
+    )
 
     # Set call context for handlers (passes client_config through)
     set_call_context(call_id, caller_number, client_config)
@@ -344,21 +433,19 @@ async def run_bot(
 
     pipeline = Pipeline([
         transport.input(),
-        stt,
-        context_aggregator.user(),
+        user_transcript_tracker,
         llm,
+        assistant_text_tracker,
         sentence_aggregator,
         prosody,
         tts,
         transport.output(),
-        context_aggregator.assistant(),
     ])
 
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,
-            audio_in_sample_rate=8000,
+            audio_in_sample_rate=24000,
             audio_out_sample_rate=8000,
             enable_metrics=True,
             enable_usage_metrics=True,
@@ -416,23 +503,11 @@ async def run_bot(
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout waiting for in-flight tasks on {call_id} — snapshotting anyway")
 
-        # Capture state BEFORE clearing context
-        booked = is_booking_complete(call_id)
-        transferred = was_transfer_complete(call_id)
-        transfer_state = get_transfer_state(call_id)
-        sms_consented = has_sms_consent(call_id)
+        # Keep per-call context until after summary/logging so a Twilio
+        # transfer-status callback can still update the state if it arrives fast.
         saved_caller = caller_number
         saved_config = dict(client_config)  # shallow copy
         saved_twilio_number = client_config.get("twilioNumber", "")
-
-        # Clean up per-call context
-        clear_call_context(call_id)
-
-        # Schedule automated follow-up SMS only if consent was explicitly given
-        if not booked and saved_caller and sms_consented is True:
-            asyncio.create_task(
-                _delayed_followup_sms(saved_caller, saved_config, delay_seconds=300)
-            )
 
         # Generate post-call summary
         call_end_time = datetime.now(ZoneInfo(timezone))
@@ -441,7 +516,7 @@ async def run_bot(
         try:
             summary_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
             summary_resp = await summary_client.chat.completions.create(
-                model="gpt-4.1-mini",
+                model=UTILITY_MODEL,
                 messages=[
                     {
                         "role": "system",
@@ -478,50 +553,95 @@ async def run_bot(
 
         logger.info(f"Call summary [{call_id}] ({duration_s}s): {summary}")
 
+        # Capture state after summary generation, immediately before logging.
+        booked = is_booking_complete(call_id)
+        transferred = was_transfer_complete(call_id)
+        transfer_state = get_transfer_state(call_id)
+        booking_log_state = get_booking_log_state(call_id)
+        sms_consented = has_sms_consent(call_id)
+        transfer_status = transfer_state.get("transfer_status")
+        callback_requested = bool(transfer_state.get("callback_requested"))
+        pending_transfer = get_pending_transfer_state(call_id)
+        if pending_transfer.get("terminal_logged"):
+            transfer_status = pending_transfer.get("transfer_status") or transfer_status
+            callback_requested = bool(pending_transfer.get("callback_requested"))
+            if pending_transfer.get("summary"):
+                summary = pending_transfer["summary"]
+
         # Determine call outcome
         if booked:
             outcome = "booked"
-        elif transferred:
-            outcome = "transferred"
-        elif transfer_state.get("callback_requested"):
+        elif callback_requested or transfer_status in ("failed", "unavailable_no_forwarding_phone"):
             outcome = "callback_requested"
+        elif transferred or transfer_status in ("requested", "dialing", "completed"):
+            outcome = "transferred"
         elif duration_s < 10:
             outcome = "voicemail"
         else:
             outcome = "info_only"
 
-        # Log call to dashboard (fire-and-forget)
-        asyncio.create_task(log_call_to_dashboard(
-            config=saved_config,
-            twilio_call_sid=call_id,
+        caller_name = str(booking_log_state.get("caller_name") or "")
+        appointment_date = str(booking_log_state.get("appointment_date") or "")
+
+        update_pending_transfer_snapshot(
+            call_id,
+            duration=duration_s,
+            summary=summary or "",
             from_number=saved_caller or "",
             to_number=saved_twilio_number,
-            duration=duration_s,
-            outcome=outcome,
-            summary=summary or "",
+            config=saved_config,
             sms_consent=sms_consented,
-            transfer_reason=transfer_state.get("transfer_reason"),
-            transfer_status=transfer_state.get("transfer_status"),
-            callback_requested=transfer_state.get("callback_requested"),
+            callback_requested=callback_requested,
             callback_due_at=transfer_state.get("callback_due_at"),
-        ))
+            caller_name=caller_name,
+            appointment_date=appointment_date,
+        )
+
+        latest_pending_transfer = get_pending_transfer_state(call_id)
+        if latest_pending_transfer.get("terminal_logged"):
+            transfer_status = latest_pending_transfer.get("transfer_status") or transfer_status
+            callback_requested = bool(latest_pending_transfer.get("callback_requested"))
+            if latest_pending_transfer.get("summary"):
+                summary = latest_pending_transfer["summary"]
+            outcome = "callback_requested" if callback_requested or transfer_status == "failed" else "transferred"
+
+        # Log call to dashboard and wait briefly so the process cannot exit before
+        # the POST is sent. Dashboard returns 201 on create and 200 on duplicate update.
+        try:
+            await asyncio.wait_for(
+                log_call_to_dashboard(
+                    config=saved_config,
+                    twilio_call_sid=call_id,
+                    from_number=saved_caller or "",
+                    to_number=saved_twilio_number,
+                    duration=duration_s,
+                    outcome=outcome,
+                    summary=summary or "",
+                    caller_name=caller_name,
+                    appointment_date=appointment_date,
+                    sms_consent=sms_consented,
+                    transfer_reason=transfer_state.get("transfer_reason"),
+                    transfer_status=transfer_status,
+                    callback_requested=callback_requested,
+                    callback_due_at=transfer_state.get("callback_due_at"),
+                ),
+                timeout=CALL_LOG_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Timed out logging call {call_id} to dashboard")
+
+        clear_pending_transfer_if_terminal(call_id)
+
+        # Clean up per-call context after all state-dependent work is done.
+        clear_call_context(call_id)
+
+        # Schedule automated follow-up SMS only if consent was explicitly given
+        if not booked and saved_caller and sms_consented is True:
+            asyncio.create_task(
+                _delayed_followup_sms(saved_caller, saved_config, delay_seconds=300)
+            )
 
         await task.cancel()
-
-    # ── Track caller speech for post-booking silence timer ──
-
-    @stt.event_handler("on_transcript")
-    async def on_transcript(stt_service, transcript):
-        nonlocal last_caller_speech_time
-        last_caller_speech_time = datetime.now(ZoneInfo(timezone))
-
-        # Compress context if message count is getting high (long calls)
-        if should_compress(context.messages):
-            try:
-                summary_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-                context.messages = await compress_context(context.messages, summary_client)
-            except Exception as e:
-                logger.warning(f"Context compression failed (non-fatal): {e}")
 
     # ── Pre-Booking Silence Watcher ────────────────────
 
@@ -554,20 +674,20 @@ async def run_bot(
 
                 if elapsed >= INITIAL_PROMPT_AT_SECONDS and not nudge_sent:
                     logger.info(f"Pre-booking silence at {INITIAL_PROMPT_AT_SECONDS}s for {cid} — sending nudge")
-                    context.messages.append({
-                        "role": "system",
-                        "content": "The caller hasn't said anything yet. Gently check in: 'Hello? Are you still there?'",
-                    })
-                    await task.queue_frames([LLMMessagesFrame(context.messages)])
+                    await _queue_context_instruction(
+                        task,
+                        context,
+                        "The caller hasn't said anything yet. Gently check in: 'Hello? Are you still there?'",
+                    )
                     nudge_sent = True
 
                 if elapsed >= GOODBYE_AT_SECONDS:
                     logger.info(f"Pre-booking silence at {GOODBYE_AT_SECONDS}s — ending call {cid}")
-                    context.messages.append({
-                        "role": "system",
-                        "content": "The caller still hasn't responded. Say briefly: 'Sounds like you might have called by mistake. Feel free to call us back anytime — have a great day!' Then stop talking.",
-                    })
-                    await task.queue_frames([LLMMessagesFrame(context.messages)])
+                    await _queue_context_instruction(
+                        task,
+                        context,
+                        "The caller still hasn't responded. Say briefly: 'Sounds like you might have called by mistake. Feel free to call us back anytime — have a great day!' Then stop talking.",
+                    )
                     await asyncio.sleep(8)
                     await task.cancel()
                     return
@@ -607,22 +727,22 @@ async def run_bot(
 
                 # At 15s: gentle nudge
                 if elapsed >= NUDGE_AFTER_SECONDS and not nudge_sent:
-                    context.messages.append({
-                        "role": "system",
-                        "content": "The caller has been quiet. Gently ask: 'Was there anything else you needed help with?'",
-                    })
-                    await task.queue_frames([LLMMessagesFrame(context.messages)])
+                    await _queue_context_instruction(
+                        task,
+                        context,
+                        "The caller has been quiet. Gently ask: 'Was there anything else you needed help with?'",
+                    )
                     nudge_sent = True
 
                 # At 25s: say goodbye and hang up
                 if elapsed >= POST_BOOKING_SILENCE_SECONDS:
                     logger.info(f"Post-booking silence ({POST_BOOKING_SILENCE_SECONDS}s) — ending call {cid}")
 
-                    context.messages.append({
-                        "role": "system",
-                        "content": "The caller has been silent for a while. Say a brief, warm goodbye like: 'Alright, sounds like we're all set! We'll see you on your scheduled day. Have a great one!' Then stop talking.",
-                    })
-                    await task.queue_frames([LLMMessagesFrame(context.messages)])
+                    await _queue_context_instruction(
+                        task,
+                        context,
+                        "The caller has been silent for a while. Say a brief, warm goodbye like: 'Alright, sounds like we're all set! We'll see you on your scheduled day. Have a great one!' Then stop talking.",
+                    )
 
                     await asyncio.sleep(8)
                     await task.cancel()
@@ -641,20 +761,20 @@ async def run_bot(
             await asyncio.sleep(MAX_CALL_DURATION_SECONDS - 60)
 
             # Warn at 9 minutes
-            context.messages.append({
-                "role": "system",
-                "content": "The call is approaching 10 minutes. Naturally wrap up the conversation — say something like 'I want to make sure I'm not keeping you too long. Is there anything else I can quickly help with?'",
-            })
-            await task.queue_frames([LLMMessagesFrame(context.messages)])
+            await _queue_context_instruction(
+                task,
+                context,
+                "The call is approaching 10 minutes. Naturally wrap up the conversation — say something like 'I want to make sure I'm not keeping you too long. Is there anything else I can quickly help with?'",
+            )
 
             await asyncio.sleep(60)
 
             # Force graceful end
-            context.messages.append({
-                "role": "system",
-                "content": "The call has reached 10 minutes. Say goodbye warmly and end the call.",
-            })
-            await task.queue_frames([LLMMessagesFrame(context.messages)])
+            await _queue_context_instruction(
+                task,
+                context,
+                "The call has reached 10 minutes. Say goodbye warmly and end the call.",
+            )
             await asyncio.sleep(10)
             await task.cancel()
         except asyncio.CancelledError:

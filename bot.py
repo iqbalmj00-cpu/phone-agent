@@ -337,7 +337,7 @@ async def run_bot(
                             language="en",
                         ),
                         turn_detection=SemanticTurnDetection(
-                            eagerness="medium",
+                            eagerness="high",
                             create_response=True,
                             interrupt_response=True,
                         ),
@@ -345,7 +345,7 @@ async def run_bot(
                 ),
                 tools=tools,
                 tool_choice="auto",
-                max_output_tokens=4096,
+                max_output_tokens=512,
             ),
         ),
     )

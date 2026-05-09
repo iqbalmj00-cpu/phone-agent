@@ -18,6 +18,7 @@ import asyncio
 import contextvars
 import json
 import re
+import time
 import aiohttp
 from datetime import datetime, timedelta
 from typing import Any
@@ -695,6 +696,8 @@ async def handle_check_container_availability(params: FunctionCallParams):
     size = params.arguments["size"]
     date = params.arguments.get("date")
     days = params.arguments.get("days")
+    call_sid = _current_call_sid.get()
+    started_at = time.perf_counter()
 
     try:
         async with aiohttp.ClientSession() as http:
@@ -703,11 +706,20 @@ async def handle_check_container_availability(params: FunctionCallParams):
                 query["date"] = date
             if days:
                 query["days"] = str(days)
+            logger.info(
+                f"container_availability start call={call_sid} "
+                f"size={size} date={date or ''} days={days or ''}"
+            )
             resp = await http.get(
                 f"{DASHBOARD_URL}/api/booking/container-availability",
                 params=query,
                 headers=_ingest_headers(config),
                 timeout=aiohttp.ClientTimeout(total=10),
+            )
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            logger.info(
+                f"container_availability response call={call_sid} "
+                f"status={resp.status} elapsed_ms={elapsed_ms}"
             )
 
             if resp.status == 200:
@@ -785,7 +797,8 @@ async def handle_check_container_availability(params: FunctionCallParams):
                     "fallback": True,
                 })
     except Exception as e:
-        logger.error(f"Container availability check failed: {e}")
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        logger.error(f"Container availability check failed after {elapsed_ms}ms: {e}")
         await params.result_callback({
             "available": False,
             "message": "I'm having trouble checking availability right now. Let me transfer you to our team to confirm.",

@@ -4,13 +4,16 @@ Keeps the last N turns in full and summarizes older turns into a compact recap
 to keep token usage stable (~2K tokens) regardless of call length.
 """
 
+import asyncio
+
 from loguru import logger
 
-from config import UTILITY_MODEL
+from config import ANTHROPIC_UTILITY_MODEL
 
 
 MAX_FULL_TURNS = 10  # Keep this many recent turns verbatim
 RECAP_REFRESH_INTERVAL = 5  # Re-summarize every N turns after threshold
+CONTEXT_COMPRESSION_WAIT_SECONDS = 6
 
 
 def should_compress(messages: list[dict]) -> bool:
@@ -27,7 +30,7 @@ async def compress_context(messages: list[dict], llm_client) -> list[dict]:
 
     Args:
         messages: Full message list including system prompt
-        llm_client: OpenAI async client for summarization
+        llm_client: Anthropic async client for summarization
 
     Returns:
         Compressed message list: [system, recap, recent turns]
@@ -54,12 +57,21 @@ async def compress_context(messages: list[dict], llm_client) -> list[dict]:
         recap_prompt += f"{turn['role'].upper()}: {turn['content']}\n"
 
     try:
-        response = await llm_client.chat.completions.create(
-            model=UTILITY_MODEL,
-            messages=[{"role": "user", "content": recap_prompt}],
-            max_tokens=200,
+        response = await asyncio.wait_for(
+            llm_client.messages.create(
+                model=ANTHROPIC_UTILITY_MODEL,
+                messages=[{"role": "user", "content": recap_prompt}],
+                max_tokens=200,
+            ),
+            timeout=CONTEXT_COMPRESSION_WAIT_SECONDS,
         )
-        recap = response.choices[0].message.content
+        recap = " ".join(
+            str(getattr(block, "text", "") or "")
+            for block in getattr(response, "content", [])
+        ).strip()
+    except asyncio.TimeoutError:
+        logger.error(f"Context compression timed out after {CONTEXT_COMPRESSION_WAIT_SECONDS}s")
+        return system_messages + recent_turns
     except Exception as e:
         logger.error(f"Context compression failed: {e}")
         # Fallback: just keep recent turns without recap

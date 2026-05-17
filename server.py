@@ -12,9 +12,7 @@ Endpoints:
 import asyncio
 import json
 import os
-from datetime import datetime
 from xml.sax.saxutils import escape, quoteattr
-from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -26,8 +24,9 @@ from config import (
     MAX_CONCURRENT_CALLS,
     TWILIO_ACCOUNT_SID,
     TWILIO_AUTH_TOKEN,
-    OPENAI_API_KEY,
+    ANTHROPIC_API_KEY,
     CARTESIA_API_KEY,
+    DEEPGRAM_API_KEY,
     DASHBOARD_URL,
     INGEST_API_KEY,
     PLATFORM_API_KEY,
@@ -35,7 +34,12 @@ from config import (
 )
 from client_config import get_client_config
 from bot import run_bot
-from agent.handlers import process_transfer_status_callback
+from agent.phone_coverage import (
+    build_handoff_twiml,
+    build_no_handoff_twiml,
+    resolve_phone_coverage_decision,
+)
+from agent.handlers import process_transfer_status_callback, sanitize_transfer_reason_token
 
 app = FastAPI(title="ScaleYourJunk Phone Agent")
 
@@ -62,7 +66,8 @@ async def health():
 async def ready():
     """Readiness check: verifies required env var names are configured."""
     required = {
-        "OPENAI_API_KEY": OPENAI_API_KEY,
+        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+        "DEEPGRAM_API_KEY": DEEPGRAM_API_KEY,
         "CARTESIA_API_KEY": CARTESIA_API_KEY,
         "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
         "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
@@ -94,89 +99,57 @@ def _public_base_url(request: Request) -> str:
     return f"{scheme}://{host}"
 
 
-def _is_within_business_hours(config: dict) -> bool:
-    """Check if the current time is within the client's business hours."""
-    tz_str = config.get("timezone", "America/Chicago")
-    now = datetime.now(ZoneInfo(tz_str))
-
-    biz_start = int(config.get("businessStart", 8))
-    biz_end = int(config.get("businessEnd", 18))
-    biz_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])  # JS convention: 0=Sun
-
-    # Convert Python weekday (0=Mon) to JS convention (0=Sun)
-    js_weekday = (now.weekday() + 1) % 7
-
-    if js_weekday not in biz_days:
-        return False
-    if now.hour < biz_start or now.hour >= biz_end:
-        return False
-    return True
-
-
-def _format_hours_label(config: dict) -> str:
-    """Format business hours for the voice message."""
-    start = int(config.get("businessStart", 8))
-    end = int(config.get("businessEnd", 18))
-    start_label = "12 AM" if start == 0 else f"{start} AM" if start < 12 else "12 PM" if start == 12 else f"{start - 12} PM"
-    end_label = "12 AM" if end == 0 else f"{end} AM" if end < 12 else "12 PM" if end == 12 else f"{end - 12} PM"
-    return f"{start_label} to {end_label}"
-
-
-def _format_days_label(config: dict) -> str:
-    """Format business days for the voice message using actual config."""
-    day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-    biz_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
-    if not biz_days:
-        return "Monday through Saturday"
-    active = [day_names[d] for d in sorted(biz_days) if 0 <= d <= 6]
-    if not active:
-        return "Monday through Saturday"
-    if len(active) == 1:
-        return active[0]
-    # Check if contiguous
-    sorted_days = sorted(biz_days)
-    is_contiguous = all(sorted_days[i+1] - sorted_days[i] == 1 for i in range(len(sorted_days)-1))
-    if is_contiguous:
-        return f"{active[0]} through {active[-1]}"
-    return ", ".join(active)
-
-
 @app.post("/twiml/{client_id}")
 async def twiml_webhook(client_id: str, request: Request):
     """Twilio calls this when a number rings. Returns TwiML that
     opens a WebSocket media stream back to /ws/{client_id}."""
 
+    # Extract call metadata from Twilio's POST form data before deciding whether
+    # the call should enter the AI stream or be handed off immediately.
+    form_data = await request.form()
+    from_number = str(form_data.get("From", "") or "")
+    to_number = str(form_data.get("To", "") or "")
+    call_sid = str(form_data.get("CallSid", "") or "")
+
     # Validate client exists
     try:
-        config = await get_client_config(client_id)
+        config = await get_client_config(client_id, force_refresh=True)
     except Exception as e:
         logger.error(f"Client config error for {client_id}: {e}")
         raise HTTPException(status_code=404, detail="Client not found")
 
-    # Extract caller's phone number from Twilio's POST form data
-    form_data = await request.form()
-    from_number = form_data.get("From", "")
-
-    # ── Starter tier: gate to business hours only ──
-    tier = config.get("planTier", "starter")
-    if tier == "starter" and not _is_within_business_hours(config):
+    # ── Client-configurable AI phone coverage ───────────────────────────────
+    coverage = resolve_phone_coverage_decision(config)
+    if coverage.error:
+        logger.warning(
+            f"Phone coverage decision warning for client={client_id}: "
+            f"mode={coverage.mode} reason={coverage.reason} error={coverage.error}"
+        )
+    if coverage.should_handoff:
         company = config.get("companyName", "us")
-        hours_label = _format_hours_label(config)
-        days_label = _format_days_label(config)
-        logger.info(f"Starter after-hours call for {company} ({client_id}) — returning closed message")
+        base_url = _public_base_url(request)
+        caller_id = config.get("twilioNumber") or to_number
+        handoff_twiml = build_handoff_twiml(
+            company_name=company,
+            forwarding_phone=config.get("forwardingPhone"),
+            caller_id=caller_id,
+            base_url=base_url,
+            client_id=client_id,
+            call_sid=call_sid,
+            reason=coverage.reason,
+        )
+        if handoff_twiml:
+            logger.info(
+                f"Phone coverage handoff for {company} ({client_id}): "
+                f"mode={coverage.mode} reason={coverage.reason} call_sid={call_sid or 'missing'}"
+            )
+            return PlainTextResponse(content=handoff_twiml, media_type="application/xml")
 
-        closed_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">
-        Thanks for calling {escape(str(company))}.
-        Our office is currently closed.
-        Our hours are {escape(str(days_label))}, {escape(str(hours_label))}.
-        Please call back during business hours,
-        or visit our website to book a pickup online.
-        Thank you, and have a great day!
-    </Say>
-</Response>"""
-        return PlainTextResponse(content=closed_twiml, media_type="application/xml")
+        logger.warning(
+            f"Phone coverage required handoff for {company} ({client_id}) but forwardingPhone "
+            f"is missing or invalid; returning safe unavailable TwiML"
+        )
+        return PlainTextResponse(content=build_no_handoff_twiml(company), media_type="application/xml")
 
     # ── Concurrent call limit — voice message instead of silent drop ──
     async with _calls_lock:
@@ -194,7 +167,7 @@ async def twiml_webhook(client_id: str, request: Request):
 </Response>"""
             return PlainTextResponse(content=busy_twiml, media_type="application/xml")
 
-    # ── Growth tier or within business hours: connect to AI agent ──
+    # ── Coverage is ON: connect to AI agent ──
     host = request.headers.get("host", "localhost")
     scheme = "wss" if request.url.scheme == "https" or "fly.dev" in host else "ws"
     ws_url = f"{scheme}://{host}/ws/{client_id}"
@@ -221,15 +194,25 @@ async def transfer_status_webhook(client_id: str, call_sid: str, request: Reques
     dial_status = str(form_data.get("DialCallStatus", "") or "")
     dial_call_sid = str(form_data.get("DialCallSid", "") or "")
     dial_duration = form_data.get("DialCallDuration", 0)
+    raw_transfer_reason = str(request.query_params.get("reason", "") or "")
+    transfer_reason = sanitize_transfer_reason_token(raw_transfer_reason)
+    if raw_transfer_reason and not transfer_reason:
+        logger.warning(
+            f"Ignoring unknown transfer reason token for client={client_id} call={call_sid}: "
+            f"{raw_transfer_reason[:80]!r}"
+        )
     logger.info(
         f"Transfer status callback: client={client_id} call={call_sid} "
         f"dial_status={dial_status or 'missing'}"
     )
     twiml = await process_transfer_status_callback(
+        client_id=client_id,
         call_sid=call_sid,
         dial_status=dial_status,
         dial_call_sid=dial_call_sid,
         dial_duration=dial_duration,
+        callback_data=dict(form_data),
+        transfer_reason=transfer_reason,
     )
     return PlainTextResponse(content=twiml, media_type="application/xml")
 

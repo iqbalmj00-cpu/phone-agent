@@ -15,15 +15,22 @@ load_dotenv(override=True)
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 
-# ── OpenAI ──────────────────────────────────────────────
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
-UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-4.1-mini")
+# ── Anthropic / Deepgram ────────────────────────────────
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+ANTHROPIC_UTILITY_MODEL = os.getenv("ANTHROPIC_UTILITY_MODEL", ANTHROPIC_MODEL)
+ANTHROPIC_STABLE_UTILITY_MODEL = os.getenv(
+    "ANTHROPIC_STABLE_UTILITY_MODEL",
+    "claude-haiku-4-5-20251001",
+)
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+DEEPGRAM_MODEL = os.getenv("DEEPGRAM_MODEL", "flux-general-en")
 
 # ── Cartesia ────────────────────────────────────────────
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 DEFAULT_CARTESIA_VOICE_ID = "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
-CARTESIA_MODEL = "sonic-3-latest"
+CARTESIA_MODEL = os.getenv("CARTESIA_MODEL", "sonic-3-latest")
+CARTESIA_SPEED = os.getenv("CARTESIA_SPEED", "normal").strip().lower()
 
 # ── Dashboard Connection ────────────────────────────────
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "")

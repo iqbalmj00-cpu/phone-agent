@@ -29,6 +29,13 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 from pipecat.services.llm_service import FunctionCallParams
 
+from agent.business_hours import (
+    format_business_hours_for_day as _shared_format_business_hours_for_day,
+    is_business_hours as _shared_is_business_hours,
+    is_open_day as _shared_is_open_day,
+)
+from agent.prompt import client_supports_dumpsters
+from client_config import get_client_config
 from config import DASHBOARD_URL, INGEST_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, GOOGLE_MAPS_API_KEY
 
 # ── Per-call context — keyed by call_sid for concurrency safety ──
@@ -38,8 +45,26 @@ _current_call_sid: contextvars.ContextVar[str] = contextvars.ContextVar("current
 # Twilio <Dial action> callbacks arrive after the media stream has ended, so
 # transfer state must outlive the normal per-call context.
 _pending_transfers: dict[str, dict[str, Any]] = {}
+_terminal_transfer_states: dict[str, dict[str, Any]] = {}
 _TRANSFER_SUCCESS_STATUSES = {"completed", "answered"}
 _TRANSFER_FAILURE_STATUSES = {"busy", "no-answer", "failed", "canceled"}
+_TRANSFER_TERMINAL_STATUSES = {"completed", "failed", "unavailable_no_forwarding_phone"}
+_TRANSFER_REASON_LABELS = {
+    "phone_coverage_off": "AI phone coverage is outside configured answering hours",
+    "phone_coverage_always_handoff": "AI phone coverage is set to always handoff",
+    "phone_coverage_missing_mode": "AI phone coverage mode was missing from dashboard config",
+    "phone_coverage_unresolved_plan_default": "dashboard returned unresolved plan_default phone coverage mode",
+    "phone_coverage_invalid_mode": "dashboard returned an invalid phone coverage mode",
+    "phone_coverage_invalid_timezone": "the configured timezone could not be evaluated",
+    "phone_coverage_business_hours_invalid": "business hours could not be evaluated for AI phone coverage",
+    "phone_coverage_custom_hours_invalid": "custom AI phone coverage hours are missing or invalid",
+}
+
+
+def sanitize_transfer_reason_token(reason: str | None) -> str:
+    """Return a known transfer reason token, or empty string for untrusted input."""
+    token = str(reason or "").strip()
+    return token if token in _TRANSFER_REASON_LABELS else ""
 
 
 def set_call_context(call_sid: str, caller_number: str, client_config: dict[str, Any]):
@@ -122,6 +147,38 @@ def mark_transfer_state(
         _call_contexts[call_sid]["transfer_reason"] = reason
     if callback_requested:
         _call_contexts[call_sid]["callback_requested"] = True
+    if status in _TRANSFER_TERMINAL_STATUSES:
+        remember_terminal_transfer_state(
+            call_sid,
+            status,
+            reason=reason,
+            callback_requested=callback_requested,
+        )
+
+
+def remember_terminal_transfer_state(
+    call_sid: str,
+    status: str,
+    *,
+    reason: str | None = None,
+    callback_requested: bool = False,
+    summary: str | None = None,
+):
+    """Remember terminal transfer state so later final logs cannot downgrade it."""
+    if not call_sid or status not in _TRANSFER_TERMINAL_STATUSES:
+        return
+    _terminal_transfer_states[call_sid] = {
+        "transfer_status": status,
+        "transfer_reason": reason,
+        "callback_requested": callback_requested,
+        "summary": summary,
+        "terminal_logged": True,
+    }
+
+
+def get_terminal_transfer_state(call_sid: str) -> dict[str, Any]:
+    terminal = _terminal_transfer_states.get(call_sid)
+    return dict(terminal) if terminal else {}
 
 
 def mark_callback_requested(
@@ -142,13 +199,21 @@ def mark_callback_requested(
 def get_transfer_state(call_sid: str) -> dict[str, Any]:
     """Return structured human-handoff and callback state captured during this call."""
     ctx = _call_contexts.get(call_sid, {})
-    return {
+    state = {
         "transfer_status": ctx.get("transfer_status"),
         "transfer_reason": ctx.get("transfer_reason"),
         "callback_requested": ctx.get("callback_requested", False),
         "callback_due_at": ctx.get("callback_due_at"),
         "callback_reason": ctx.get("callback_reason"),
     }
+    terminal = get_terminal_transfer_state(call_sid)
+    if terminal:
+        state.update({
+            "transfer_status": terminal.get("transfer_status") or state.get("transfer_status"),
+            "transfer_reason": terminal.get("transfer_reason") or state.get("transfer_reason"),
+            "callback_requested": bool(terminal.get("callback_requested")),
+        })
+    return state
 
 
 def _remember_pending_transfer(
@@ -241,6 +306,63 @@ def has_sms_consent(call_sid: str) -> bool | None:
     """Check SMS consent status. Returns None if not yet asked."""
     ctx = _call_contexts.get(call_sid, {})
     return ctx.get("sms_consent", None)
+
+
+def _normalize_container_size(size: Any) -> str:
+    text = str(size or "").lower()
+    match = re.search(r"\d+", text)
+    return match.group(0) if match else text.strip()
+
+
+def _normalize_rental_days(days: Any) -> int:
+    try:
+        normalized = int(days)
+    except (TypeError, ValueError):
+        return 7
+    return normalized if normalized > 0 else 7
+
+
+def _dashboard_safe_duration_notes(text: Any) -> str:
+    """Avoid triggering dashboard's legacy week-based rental duration regex."""
+    return re.sub(r"week", "wk", str(text or ""), flags=re.IGNORECASE)
+
+
+def _availability_key(size: Any, date: Any, days: Any) -> str:
+    return "|".join((
+        _normalize_container_size(size),
+        str(date or "").strip(),
+        str(_normalize_rental_days(days)),
+    ))
+
+
+def remember_container_availability(
+    call_sid: str,
+    size: Any,
+    date: Any,
+    days: Any,
+    data: dict[str, Any],
+):
+    """Cache date-specific positive container availability for this call."""
+    if call_sid not in _call_contexts or not date or not data.get("available"):
+        return
+    key = _availability_key(size, date, days)
+    if not key.startswith("|"):
+        availability = _call_contexts[call_sid].setdefault("container_availability", {})
+        availability[key] = {
+            "size": _normalize_container_size(size),
+            "date": str(date).strip(),
+            "days": _normalize_rental_days(days),
+            "checked_at": time.time(),
+        }
+
+
+def has_container_availability(call_sid: str, size: Any, date: Any, days: Any) -> bool:
+    """Return true only when this call already checked matching live inventory."""
+    if not call_sid or not size or not date:
+        return False
+    ctx = _call_contexts.get(call_sid, {})
+    availability = ctx.get("container_availability", {})
+    return _availability_key(size, date, days) in availability
 
 
 def _phone_lookup_key(phone: str) -> str:
@@ -615,12 +737,200 @@ async def _safe_json(resp: aiohttp.ClientResponse, label: str) -> dict:
         return {"error": f"Dashboard returned non-JSON (status {resp.status})"}
 
 
+_DAY_WORDS = {
+    1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth",
+    6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth",
+    11: "eleventh", 12: "twelfth", 13: "thirteenth", 14: "fourteenth",
+    15: "fifteenth", 16: "sixteenth", 17: "seventeenth", 18: "eighteenth",
+    19: "nineteenth", 20: "twentieth", 21: "twenty first",
+    22: "twenty second", 23: "twenty third", 24: "twenty fourth",
+    25: "twenty fifth", 26: "twenty sixth", 27: "twenty seventh",
+    28: "twenty eighth", 29: "twenty ninth", 30: "thirtieth",
+    31: "thirty first",
+}
+_DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+
+
+def _parse_hhmm(value: Any) -> int | None:
+    try:
+        hour_text, minute_text = str(value).strip().split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text[:2])
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour * 60 + minute
+
+
+def _format_minutes_spoken(minutes: int | None) -> str:
+    if minutes is None:
+        return "that time"
+    hour = (minutes // 60) % 24
+    minute = minutes % 60
+    suffix = "AM" if hour < 12 else "PM"
+    hour_12 = hour % 12 or 12
+    if minute == 0:
+        return f"{hour_12} {suffix}"
+    return f"{hour_12}:{minute:02d} {suffix}"
+
+
+def _format_spoken_time(value: Any) -> str:
+    return _format_minutes_spoken(_parse_hhmm(value))
+
+
+def _format_spoken_date(value: Any) -> str:
+    if not value:
+        return "that day"
+    text = str(value).strip()
+    try:
+        if "T" in text:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        else:
+            parsed = datetime.strptime(text[:10], "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return "that day"
+    day = _DAY_WORDS.get(parsed.day, str(parsed.day))
+    return f"{parsed.strftime('%A')}, {parsed.strftime('%B')} {day}"
+
+
+def _format_spoken_slot(slot: dict[str, Any]) -> str:
+    if str(slot.get("period", "")).lower() == "all day":
+        return "all day"
+    start = _format_spoken_time(slot.get("start"))
+    end = _format_spoken_time(slot.get("end"))
+    if start == "that time" or end == "that time":
+        return str(slot.get("period") or "that time")
+    return f"{start} to {end}"
+
+
+def _slot_window_minutes(slot_or_hour: Any) -> tuple[int | None, int | None]:
+    if isinstance(slot_or_hour, dict):
+        start = slot_or_hour.get("start_minute")
+        end = slot_or_hour.get("end_minute")
+        if start is None:
+            start = _parse_hhmm(slot_or_hour.get("start"))
+        if end is None:
+            end = _parse_hhmm(slot_or_hour.get("end"))
+        return start, end
+    try:
+        hour = int(slot_or_hour)
+    except (TypeError, ValueError):
+        return None, None
+    return hour * 60, None
+
+
+def _coerce_business_window(day_value: Any) -> tuple[bool, tuple[int, int] | None]:
+    if day_value is None or day_value is False:
+        return True, None
+
+    if isinstance(day_value, str):
+        value = day_value.strip().lower()
+        if value in {"closed", "off", "false", "none"}:
+            return True, None
+        if "-" in value:
+            start_text, end_text = value.split("-", 1)
+            start = _parse_hhmm(start_text)
+            end = _parse_hhmm(end_text)
+            if start is not None and end is not None:
+                return True, (start, end)
+        return False, None
+
+    if isinstance(day_value, list):
+        if not day_value:
+            return True, None
+        day_value = day_value[0]
+
+    if isinstance(day_value, dict):
+        closed_value = day_value.get("closed", day_value.get("isClosed"))
+        if closed_value is True or str(closed_value).strip().lower() in {"1", "true", "yes", "closed"}:
+            return True, None
+        enabled_value = day_value.get("enabled", day_value.get("isOpen"))
+        if enabled_value is False or str(enabled_value).strip().lower() in {"0", "false", "no"}:
+            return True, None
+        start_text = (
+            day_value.get("open")
+            or day_value.get("start")
+            or day_value.get("from")
+            or day_value.get("opens")
+        )
+        end_text = (
+            day_value.get("close")
+            or day_value.get("end")
+            or day_value.get("to")
+            or day_value.get("closes")
+        )
+        start = _parse_hhmm(start_text)
+        end = _parse_hhmm(end_text)
+        if start is not None and end is not None:
+            return True, (start, end)
+        return False, None
+
+    return False, None
+
+
+def _get_exact_business_window(config: dict[str, Any], js_day: int) -> tuple[bool, tuple[int, int] | None]:
+    hours = config.get("businessHours")
+    if not isinstance(hours, dict):
+        return False, None
+
+    candidate_keys = (_DAY_KEYS[js_day], str(js_day), js_day)
+    for key in candidate_keys:
+        if key in hours:
+            return _coerce_business_window(hours.get(key))
+    return False, None
+
+
+def _is_open_day(date: datetime, config: dict[str, Any]) -> bool:
+    js_day = (date.weekday() + 1) % 7
+    exact_found, exact_window = _get_exact_business_window(config, js_day)
+    if exact_found:
+        return exact_window is not None
+    business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
+    return js_day in business_days
+
+
+def _format_business_hours_for_day(config: dict[str, Any], date: datetime) -> str:
+    js_day = (date.weekday() + 1) % 7
+    exact_found, exact_window = _get_exact_business_window(config, js_day)
+    if exact_found and exact_window:
+        return (
+            f"That's outside our hours. We're available that day from "
+            f"{_format_minutes_spoken(exact_window[0])} to {_format_minutes_spoken(exact_window[1])}."
+        )
+    if exact_found and exact_window is None:
+        return "We're closed that day. Ask which other day works best."
+    business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
+    if js_day not in business_days:
+        return "We're closed that day. Ask which other day works best."
+    business_start = int(config.get("businessStart", 7))
+    business_end = int(config.get("businessEnd", 19))
+    return (
+        f"That's outside our hours. We're available from "
+        f"{_format_minutes_spoken(business_start * 60)} to {_format_minutes_spoken(business_end * 60)}."
+    )
+
+
+def _normalize_e164_phone(value: Any) -> str | None:
+    text = str(value or "").strip()
+    digits = re.sub(r"\D+", "", text)
+    if not digits:
+        return None
+    if text.startswith("+") and 10 <= len(digits) <= 15:
+        return f"+{digits}"
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return None
+
+
 # ── Time Slots (must match website wizardData.ts) ───────
 
 TIME_SLOTS = {
-    "morning":   {"label": "Morning",   "start": "08:00", "end": "11:00", "start_hour": 8,  "period": "Morning"},
-    "midday":    {"label": "Midday",    "start": "11:00", "end": "13:00", "start_hour": 11, "period": "Midday"},
-    "afternoon": {"label": "Afternoon", "start": "13:00", "end": "16:00", "start_hour": 13, "period": "Afternoon"},
+    "morning":   {"label": "Morning",   "start": "08:00", "end": "11:00", "start_hour": 8,  "start_minute": 480, "end_minute": 660, "period": "Morning"},
+    "midday":    {"label": "Midday",    "start": "11:00", "end": "13:00", "start_hour": 11, "start_minute": 660, "end_minute": 780, "period": "Midday"},
+    "afternoon": {"label": "Afternoon", "start": "13:00", "end": "16:00", "start_hour": 13, "start_minute": 780, "end_minute": 960, "period": "Afternoon"},
 }
 
 
@@ -650,33 +960,49 @@ def _validate_time_slot(slot_id: str) -> dict | None:
     if "-" in stripped:
         parts = stripped.split("-")
         if len(parts) == 2:
-            try:
-                sh, sm = parts[0].split(":")
-                eh, em = parts[1].split(":")
-                start_hour = int(sh)
+            start_minute = _parse_hhmm(parts[0])
+            end_minute = _parse_hhmm(parts[1])
+            if start_minute is not None and end_minute is not None:
                 return {
                     "label": f"{parts[0]} - {parts[1]}",
                     "start": parts[0],
                     "end": parts[1],
-                    "start_hour": start_hour,
+                    "start_hour": start_minute // 60,
+                    "start_minute": start_minute,
+                    "end_minute": end_minute,
                     "period": stripped,  # Use the range as the period
                 }
-            except (ValueError, IndexError):
-                pass
     return None
 
 
-def _is_business_hours(date: datetime, hour: int, config: dict) -> bool:
+def _is_business_hours(date: datetime, slot_or_hour: Any, config: dict) -> bool:
     """Check if date/time falls within this client's business hours."""
-    business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
-    business_start = int(config.get("businessStart", 7))
-    business_end = int(config.get("businessEnd", 19))
-
     # Convert Python weekday (0=Mon) to JS convention (0=Sun) used by dashboard
     js_day = (date.weekday() + 1) % 7
+    start_minute, end_minute = _slot_window_minutes(slot_or_hour)
+    if start_minute is None:
+        return False
+
+    exact_found, exact_window = _get_exact_business_window(config, js_day)
+    if exact_found:
+        if exact_window is None:
+            return False
+        open_minute, close_minute = exact_window
+        if start_minute < open_minute:
+            return False
+        if end_minute is not None and end_minute > close_minute:
+            return False
+        return start_minute < close_minute
+
+    business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
+    business_start = int(config.get("businessStart", 7)) * 60
+    business_end = int(config.get("businessEnd", 19)) * 60
+
     if js_day not in business_days:
         return False
-    if hour < business_start or hour >= business_end:
+    if start_minute < business_start or start_minute >= business_end:
+        return False
+    if end_minute is not None and end_minute > business_end:
         return False
     return True
 
@@ -695,20 +1021,31 @@ async def handle_check_container_availability(params: FunctionCallParams):
     config = _get_config()
     size = params.arguments["size"]
     date = params.arguments.get("date")
-    days = params.arguments.get("days")
+    rental_days = _normalize_rental_days(params.arguments.get("days"))
     call_sid = _current_call_sid.get()
     started_at = time.perf_counter()
+
+    if not client_supports_dumpsters(config):
+        await params.result_callback({
+            "available": False,
+            "error": "unsupported_service",
+            "message": (
+                "This client does not offer dumpster rentals. Do not quote dumpster "
+                "prices or discuss container sizes. Redirect to junk removal pickup "
+                "or offer a human transfer."
+            ),
+        })
+        return
 
     try:
         async with aiohttp.ClientSession() as http:
             query: dict[str, str] = {"size": size}
             if date:
                 query["date"] = date
-            if days:
-                query["days"] = str(days)
+            query["days"] = str(rental_days)
             logger.info(
                 f"container_availability start call={call_sid} "
-                f"size={size} date={date or ''} days={days or ''}"
+                f"size={size} date={date or ''} days={rental_days}"
             )
             resp = await http.get(
                 f"{DASHBOARD_URL}/api/booking/container-availability",
@@ -728,6 +1065,13 @@ async def handle_check_container_availability(params: FunctionCallParams):
                     base_rate = data.get("baseRate")
                     included_days = data.get("includedDays", 7)
                     extended_rate = data.get("extendedDailyRate")
+                    remember_container_availability(
+                        call_sid,
+                        size,
+                        date,
+                        rental_days,
+                        data,
+                    )
 
                     # Round to nearest $5 for clean customer-facing prices
                     def _round5(n: float) -> int:
@@ -751,13 +1095,7 @@ async def handle_check_container_availability(params: FunctionCallParams):
                     alternatives = data.get("alternativeSizes", [])
                     next_date = data.get("nextAvailableDate")
                     if next_date:
-                        # Parse ISO date to readable format
-                        try:
-                            from datetime import datetime as _dt
-                            nd = _dt.fromisoformat(next_date.replace("Z", "+00:00"))
-                            next_date_str = nd.strftime("%A, %B %d")
-                        except Exception:
-                            next_date_str = next_date
+                        next_date_str = _format_spoken_date(next_date)
                     else:
                         next_date_str = None
 
@@ -881,18 +1219,8 @@ async def handle_check_available_slots(params: FunctionCallParams):
     parsed_date = _validate_date(date)
     if not parsed_date:
         await params.result_callback({
-            "error": "I need the date in YYYY-MM-DD format. Please resolve relative dates first."
-        })
-        return
-
-    # Business day check
-    business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
-    js_day = (parsed_date.weekday() + 1) % 7
-    if js_day not in business_days:
-        await params.result_callback({
-            "available": False,
-            "slots": [],
-            "message": "We're closed that day. Ask which weekday works best."
+            "error": "invalid_date",
+            "message": "Ask the caller which day they mean in natural language, then resolve the tool date internally before trying again. Do not ask the caller for a date format.",
         })
         return
 
@@ -910,25 +1238,14 @@ async def handle_check_available_slots(params: FunctionCallParams):
                 available = [s for s in slots if s.get("available")]
                 full = [s for s in slots if not s.get("available")]
 
-                # Format human-readable times
-                def fmt_time(t: str) -> str:
-                    """Convert '08:00' to '8 AM', '14:00' to '2 PM'."""
-                    try:
-                        h = int(t.split(":")[0])
-                        if h == 0: return "12 AM"
-                        if h == 12: return "12 PM"
-                        return f"{h} AM" if h < 12 else f"{h - 12} PM"
-                    except (ValueError, IndexError):
-                        return t
-
                 if available:
-                    time_strs = [f"{fmt_time(s['start'])} to {fmt_time(s['end'])}" for s in available]
-                    msg = f"Available times on {date}: {', '.join(time_strs)}."
+                    time_strs = [f"{_format_spoken_time(s['start'])} to {_format_spoken_time(s['end'])}" for s in available]
+                    msg = f"Available times on {_format_spoken_date(date)}: {', '.join(time_strs)}."
                     if full:
-                        full_strs = [f"{fmt_time(s['start'])} to {fmt_time(s['end'])}" for s in full]
+                        full_strs = [f"{_format_spoken_time(s['start'])} to {_format_spoken_time(s['end'])}" for s in full]
                         msg += f" Not available: {', '.join(full_strs)}."
                 else:
-                    msg = f"No booking windows are available on {date}. Suggest a different date."
+                    msg = f"No booking windows are available on {_format_spoken_date(date)}. Suggest a different date."
 
                 await params.result_callback({
                     "available": len(available) > 0,
@@ -980,23 +1297,64 @@ async def handle_create_booking(params: FunctionCallParams):
     description = params.arguments["description"]
     booking_type = params.arguments.get("type", "pickup")
     container_size = params.arguments.get("container_size")
-    rental_duration_days = params.arguments.get("rental_duration_days", 7)
+    rental_duration_days = _normalize_rental_days(params.arguments.get("rental_duration_days", 7))
     call_sid = ctx.get("call_sid", "")
 
     is_dumpster = booking_type in ("dumpster_rental", "dumpster_swap")
     is_swap = booking_type == "dumpster_swap"
     service_type = booking_type if is_dumpster else "junk_removal"
 
+    if is_dumpster and not client_supports_dumpsters(config):
+        await params.result_callback({
+            "fallback": True,
+            "error": "unsupported_service",
+            "message": (
+                "This client does not offer dumpster rentals. Do not create a "
+                "dumpster booking. Redirect to junk removal pickup or offer a "
+                "human transfer."
+            ),
+        })
+        return
+
     # ── Validate date ──
     parsed_date = _validate_date(date)
     if not parsed_date:
-        await params.result_callback({"error": "Date must be YYYY-MM-DD format."})
+        await params.result_callback({
+            "error": "invalid_date",
+            "message": "Ask the caller which day they mean in natural language, then resolve the tool date internally before trying again. Do not ask the caller for a date format.",
+        })
         return
+
+    if is_dumpster and not is_swap:
+        if not container_size:
+            await params.result_callback({
+                "error": "container_size_required",
+                "message": "Ask what dumpster size they want, or recommend a size based on their project, before creating the rental.",
+            })
+            return
+        if not has_container_availability(call_sid, container_size, date, rental_duration_days):
+            await params.result_callback({
+                "error": "availability_check_required",
+                "message": (
+                    "Check live container availability for that size, delivery day, "
+                    "and rental duration before creating this dumpster rental. Do not "
+                    "create the booking yet."
+                ),
+            })
+            return
 
     # ── Validate time slot ──
     if not time_slot_id and is_dumpster and not is_swap:
         # Dumpster rentals are all-day deliveries — no time slot needed
-        slot = {"label": "All Day", "start": "08:00", "end": "17:00", "start_hour": 8, "period": "All Day"}
+        slot = {
+            "label": "All Day",
+            "start": "08:00",
+            "end": "17:00",
+            "start_hour": 8,
+            "start_minute": 480,
+            "end_minute": 1020,
+            "period": "All Day",
+        }
     else:
         slot = _validate_time_slot(time_slot_id)
         if not slot:
@@ -1006,11 +1364,13 @@ async def handle_create_booking(params: FunctionCallParams):
             return
 
     # ── Business hours check ──
-    if not _is_business_hours(parsed_date, slot["start_hour"], config):
-        business_start = int(config.get("businessStart", 7))
-        business_end = int(config.get("businessEnd", 19))
+    if str(slot.get("period", "")).lower() == "all day":
+        is_valid_window = _shared_is_open_day(parsed_date, config)
+    else:
+        is_valid_window = _shared_is_business_hours(parsed_date, slot, config)
+    if not is_valid_window:
         await params.result_callback({
-            "error": f"That's outside our hours. We're available from {_format_hour(business_start)} to {_format_hour(business_end)}."
+            "error": _shared_format_business_hours_for_day(config, parsed_date)
         })
         return
 
@@ -1032,7 +1392,12 @@ async def handle_create_booking(params: FunctionCallParams):
         notes = f"Dumpster Swap: pick up full {size_str} container, drop off empty. {description}"
     elif is_dumpster:
         size_str = f"{container_size}-yard" if container_size else "TBD size"
-        notes = f"Dumpster Rental Delivery: {size_str} container, {rental_duration_days} day rental. Project: {description}"
+        safe_description = _dashboard_safe_duration_notes(description)
+        notes = (
+            f"Dumpster Rental Delivery: {size_str} container. "
+            f"rental_duration: {rental_duration_days}. "
+            f"Rental length: {rental_duration_days} days. Project: {safe_description}"
+        )
     else:
         notes = f"Junk Removal Pickup: {description}"
 
@@ -1068,6 +1433,8 @@ async def handle_create_booking(params: FunctionCallParams):
         "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
         "consentTextVersion": "v1",
     }
+    spoken_date = _format_spoken_date(date)
+    spoken_slot = _format_spoken_slot(slot)
 
     # ── API call wrapped in an independent task ──
     # If the caller hangs up mid-request, this task keeps running so:
@@ -1109,7 +1476,7 @@ async def handle_create_booking(params: FunctionCallParams):
                         result = {
                             "success": True,
                             "booking_id": str(job_id),
-                            "message": f"Dumpster swap scheduled for {date}, {slot['period']} window. We'll pick up the full container and drop off an empty one.",
+                            "message": f"Dumpster swap scheduled for {spoken_date}, {spoken_slot}. We'll pick up the full container and drop off an empty one.",
                         }
                     elif is_dumpster and auto_booked:
                         size_label = f"{container_size}-yard" if container_size else ""
@@ -1117,7 +1484,7 @@ async def handle_create_booking(params: FunctionCallParams):
                             "success": True,
                             "autoBooked": True,
                             "booking_id": str(job_id),
-                            "message": f"Dumpster rental CONFIRMED for {date}. {size_label} container, {rental_duration_days} day rental. Delivery is scheduled. If SMS consent was recorded earlier in the call, you may tell the caller they'll receive a confirmation text shortly. Do not promise an email unless the dashboard explicitly confirms one.",
+                            "message": f"Dumpster rental CONFIRMED for {spoken_date}. {size_label} container, {rental_duration_days} day rental. Delivery is scheduled. If SMS consent was recorded earlier in the call, you may tell the caller they'll receive a confirmation text shortly. Do not promise an email unless the dashboard explicitly confirms one.",
                         }
                     elif is_dumpster:
                         size_label = f"{container_size}-yard" if container_size else ""
@@ -1125,30 +1492,22 @@ async def handle_create_booking(params: FunctionCallParams):
                             "success": True,
                             "autoBooked": False,
                             "booking_id": str(job_id),
-                            "message": f"Dumpster rental request submitted for {date}. {size_label} container, {rental_duration_days} day rental. Our team will follow up to confirm availability and pricing.",
+                            "message": f"Dumpster rental request submitted for {spoken_date}. {size_label} container, {rental_duration_days} day rental. Our team will follow up to confirm availability and pricing.",
                         }
                     else:
                         result = {
                             "success": True,
                             "booking_id": str(job_id),
-                            "message": f"Booking confirmed for {date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
+                            "message": f"Booking confirmed for {spoken_date}, {spoken_slot}.",
                         }
                 elif resp.status == 409:
                     # slot_full — the time slot filled between checking and booking
                     data = await _safe_json(resp, "create-booking-conflict")
                     available_slots = data.get("availableSlots", [])
                     if available_slots:
-                        def fmt_t(t: str) -> str:
-                            try:
-                                h = int(t.split(":")[0])
-                                if h == 0: return "12 AM"
-                                if h == 12: return "12 PM"
-                                return f"{h} AM" if h < 12 else f"{h - 12} PM"
-                            except (ValueError, IndexError):
-                                return t
                         avail = [s for s in available_slots if s.get("available")]
                         if avail:
-                            alt_strs = [f"{fmt_t(s['start'])} to {fmt_t(s['end'])}" for s in avail[:4]]
+                            alt_strs = [f"{_format_spoken_time(s['start'])} to {_format_spoken_time(s['end'])}" for s in avail[:4]]
                             result = {
                                 "error": "slot_full",
                                 "message": f"That time slot just filled up. Available alternatives: {', '.join(alt_strs)}. Ask the caller which works.",
@@ -1157,7 +1516,7 @@ async def handle_create_booking(params: FunctionCallParams):
                         else:
                             result = {
                                 "error": "slot_full",
-                                "message": f"That time slot and all others on {date} are now full. Suggest a different date.",
+                                "message": f"That time slot and all others on {spoken_date} are now full. Suggest a different date.",
                                 "availableSlots": [],
                             }
                     else:
@@ -1282,7 +1641,10 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
 
     parsed_date = _validate_date(new_date)
     if not parsed_date:
-        await params.result_callback({"error": "Date must be YYYY-MM-DD format."})
+        await params.result_callback({
+            "error": "invalid_date",
+            "message": "Ask the caller which day they mean in natural language, then resolve the tool date internally before trying again. Do not ask the caller for a date format.",
+        })
         return
 
     slot = _validate_time_slot(new_time_slot_id)
@@ -1292,9 +1654,9 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
         })
         return
 
-    if not _is_business_hours(parsed_date, slot["start_hour"], config):
+    if not _shared_is_business_hours(parsed_date, slot, config):
         await params.result_callback({
-            "error": "That's outside our business hours."
+            "error": _shared_format_business_hours_for_day(config, parsed_date)
         })
         return
 
@@ -1328,7 +1690,7 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
                 reset_tool_failure(ctx.get("call_sid", ""), "reschedule_appointment")
                 await params.result_callback({
                     "success": True,
-                    "message": f"Appointment rescheduled to {new_date}, {slot['period']} window ({slot['start']} - {slot['end']}).",
+                    "message": f"Appointment rescheduled to {_format_spoken_date(new_date)}, {_format_spoken_slot(slot)}.",
                 })
                 logger.info(f"Rescheduled for {phone} to {new_date} ({slot['period']} window)")
             else:
@@ -1577,7 +1939,7 @@ async def handle_schedule_callback(params: FunctionCallParams):
     if "T" not in requested_time:
         await _deliver_result({
             "error": "requested_time_must_include_time",
-            "message": "The callback time needs both a date and time. Ask the caller for an exact callback time, then use YYYY-MM-DDTHH:MM:SS.",
+            "message": "Ask the caller for the exact callback day and time in natural language, then resolve the tool timestamp internally before trying again. Do not ask the caller for a technical timestamp.",
         })
         return
 
@@ -1628,11 +1990,10 @@ async def handle_schedule_callback(params: FunctionCallParams):
                     return
 
                 data = await _safe_json(resp, "schedule-callback-error")
-                message = data.get("error") or data.get("message") or "That callback time is not available."
                 if resp.status in (400, 422):
                     await _deliver_result({
                         "error": "invalid_callback_time",
-                        "message": f"{message} Ask the caller for another time during business hours.",
+                        "message": "That callback time is not available. Ask the caller for another time during business hours.",
                     })
                     return
 
@@ -1688,8 +2049,9 @@ async def handle_transfer_to_human(params: FunctionCallParams):
         mark_transfer_state(call_sid, "requested", reason)
 
     # No forwarding number configured — take a message instead
-    if not forwarding_phone:
-        logger.warning(f"No forwardingPhone configured — cannot transfer call {call_sid}")
+    normalized_forwarding_phone = _normalize_e164_phone(forwarding_phone)
+    if not normalized_forwarding_phone:
+        logger.warning(f"No valid forwardingPhone configured — cannot transfer call {call_sid}")
         if call_sid:
             mark_transfer_state(
                 call_sid,
@@ -1752,7 +2114,7 @@ async def handle_transfer_to_human(params: FunctionCallParams):
     transfer_twiml = (
         f'<Response>'
         f'<Say voice="Polly.Joanna">Please hold while we connect you with {escape(str(company_name))}.</Say>'
-        f'<Dial {dial_attr_str}>{escape(str(forwarding_phone))}</Dial>'
+        f'<Dial {dial_attr_str}>{escape(normalized_forwarding_phone)}</Dial>'
         f'{post_dial_fallback}'
         f'</Response>'
     )
@@ -1765,13 +2127,19 @@ async def handle_transfer_to_human(params: FunctionCallParams):
             twiml=transfer_twiml,
         )
 
-        logger.info(f"Call {call_sid} transferred to {forwarding_phone} (reason: {reason})")
+        logger.info(f"Call {call_sid} transferred to {normalized_forwarding_phone} (reason: {reason})")
 
         # Twilio accepting the redirect only means dialing started. The final
         # completed/failed state comes later from the <Dial action> callback.
         if ctx.get("call_sid"):
             mark_transfer_state(ctx["call_sid"], "dialing", reason)
             _update_pending_transfer_status(ctx["call_sid"], "dialing")
+            await _log_interim_transfer_requested(
+                call_sid=ctx["call_sid"],
+                config=config,
+                from_number=ctx.get("caller_number", ""),
+                reason=reason,
+            )
 
         await params.result_callback({
             "transferred": True,
@@ -1797,6 +2165,10 @@ async def handle_transfer_to_human(params: FunctionCallParams):
 
 
 # ── SMS Messaging ──────────────────────────────────────
+
+# handle_send_sms is intentionally not registered as a live LLM tool in bot.py.
+# Current in-call behavior is consent capture; actual booking and follow-up SMS
+# sends are handled by dashboard/post-call paths.
 
 # Fixed SMS templates — LLM picks a template name and supplies variables.
 _SMS_TEMPLATES: dict[str, str] = {
@@ -2170,11 +2542,133 @@ def _parse_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _callback_value(callback_data: dict[str, Any] | None, *keys: str) -> str:
+    if not callback_data:
+        return ""
+    for key in keys:
+        value = callback_data.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _transfer_reason_label(reason: str | None) -> str:
+    token = sanitize_transfer_reason_token(reason)
+    if not token:
+        return ""
+    label = _TRANSFER_REASON_LABELS[token]
+    return re.sub(r"[\r\n\t]+", " ", label).strip()[:200]
+
+
+def _coverage_transfer_summary(reason: str | None, label: str) -> str:
+    token = str(reason or "").strip()
+    if token not in _TRANSFER_REASON_LABELS:
+        return ""
+    return f"Call was routed to handoff because {label}."
+
+
+async def _fetch_twilio_call_snapshot(call_sid: str) -> dict[str, Any]:
+    if not call_sid:
+        return {}
+    try:
+        client = _get_twilio_client()
+        call = await asyncio.to_thread(client.calls(call_sid).fetch)
+        return {
+            "from_number": str(getattr(call, "from_", "") or ""),
+            "to_number": str(getattr(call, "to", "") or ""),
+            "duration": _parse_int(getattr(call, "duration", 0), 0),
+        }
+    except Exception as e:
+        logger.warning(f"Could not fetch Twilio call snapshot for {call_sid}: {e}")
+        return {}
+
+
+async def _recover_pending_transfer(
+    *,
+    client_id: str | None,
+    call_sid: str,
+    callback_data: dict[str, Any] | None,
+    dial_duration: str | int | None,
+    transfer_reason: str | None = None,
+) -> dict[str, Any] | None:
+    """Recover enough transfer state to log a terminal Dial callback after restart."""
+    if not client_id:
+        return None
+    try:
+        config = await get_client_config(client_id)
+    except Exception as e:
+        logger.error(f"Could not recover config for transfer callback client={client_id}: {e}")
+        return None
+
+    snapshot = await _fetch_twilio_call_snapshot(call_sid)
+    from_number = (
+        _callback_value(callback_data, "From", "Caller")
+        or snapshot.get("from_number")
+        or "unknown"
+    )
+    to_number = (
+        _callback_value(callback_data, "To", "Called")
+        or snapshot.get("to_number")
+        or config.get("twilioNumber", "")
+    )
+    duration = max(_parse_int(snapshot.get("duration"), 0), _parse_int(dial_duration, 0))
+    reason = _transfer_reason_label(transfer_reason) or "Caller requested human handoff"
+    return {
+        "config": config,
+        "from_number": from_number,
+        "to_number": to_number,
+        "reason": reason,
+        "transfer_status": "requested",
+        "duration": duration,
+        "summary": _coverage_transfer_summary(transfer_reason, reason),
+        "sms_consent": None,
+        "callback_requested": False,
+        "callback_due_at": None,
+        "caller_name": None,
+        "appointment_date": None,
+        "recovered": True,
+    }
+
+
+async def _log_interim_transfer_requested(
+    *,
+    call_sid: str,
+    config: dict[str, Any],
+    from_number: str,
+    reason: str,
+):
+    terminal = get_terminal_transfer_state(call_sid)
+    if terminal.get("transfer_status") in _TRANSFER_TERMINAL_STATUSES:
+        logger.info(f"Skipping interim transfer log for {call_sid}; terminal status already recorded")
+        return
+    try:
+        await asyncio.wait_for(
+            log_call_to_dashboard(
+                config=config,
+                twilio_call_sid=call_sid,
+                from_number=from_number or "unknown",
+                to_number=config.get("twilioNumber", ""),
+                duration=0,
+                outcome="transferred",
+                summary=f"Caller requested human handoff ({reason}); transfer dialing.",
+                transfer_reason=reason,
+                transfer_status="dialing",
+                callback_requested=False,
+            ),
+            timeout=3,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"Timed out writing interim transfer log for {call_sid}")
+
+
 async def process_transfer_status_callback(
+    client_id: str | None,
     call_sid: str,
     dial_status: str,
     dial_call_sid: str = "",
     dial_duration: str | int | None = None,
+    callback_data: dict[str, Any] | None = None,
+    transfer_reason: str | None = None,
 ) -> str:
     """Handle Twilio <Dial action> status and update the dashboard call log."""
     status = (dial_status or "").strip().lower()
@@ -2198,7 +2692,7 @@ async def process_transfer_status_callback(
         mark_transfer_state(
             call_sid,
             transfer_status,
-            pending.get("reason") if pending else None,
+            pending.get("reason") if pending else _transfer_reason_label(transfer_reason) or None,
             callback_requested=callback_requested,
         )
         if transfer_status == "completed":
@@ -2212,6 +2706,44 @@ async def process_transfer_status_callback(
 
     if not pending:
         logger.warning(f"Transfer status callback received without pending context for {call_sid}")
+        pending = await _recover_pending_transfer(
+            client_id=client_id,
+            call_sid=call_sid,
+            callback_data=callback_data,
+            dial_duration=dial_duration,
+            transfer_reason=transfer_reason,
+        )
+        if not pending:
+            remember_terminal_transfer_state(
+                call_sid,
+                transfer_status,
+                callback_requested=callback_requested,
+            )
+            if callback_requested:
+                return (
+                    '<Response><Say voice="Polly.Joanna">'
+                    "We were not able to reach anyone right now. Please try again later. Goodbye."
+                    "</Say><Hangup/></Response>"
+                )
+            return "<Response><Hangup/></Response>"
+
+    if callback_requested:
+        remember_terminal_transfer_state(
+            call_sid,
+            transfer_status,
+            reason=pending.get("reason"),
+            callback_requested=True,
+        )
+    else:
+        remember_terminal_transfer_state(
+            call_sid,
+            transfer_status,
+            reason=pending.get("reason"),
+            callback_requested=False,
+        )
+
+    if not pending.get("config"):
+        logger.warning(f"Transfer status callback for {call_sid} has no dashboard config; skipping log")
         if callback_requested:
             return (
                 '<Response><Say voice="Polly.Joanna">'
@@ -2253,6 +2785,13 @@ async def process_transfer_status_callback(
         transfer_status=transfer_status,
         callback_requested=callback_requested,
         callback_due_at=pending.get("callback_due_at"),
+    )
+    remember_terminal_transfer_state(
+        call_sid,
+        transfer_status,
+        reason=reason,
+        callback_requested=callback_requested,
+        summary=summary,
     )
 
     logger.info(

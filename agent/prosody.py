@@ -51,8 +51,18 @@ class CartesiaContinuationTTS(CartesiaTTSService):
 
 
 # ── Phone number patterns ───────────────────────────────
-_PHONE_PAREN = re.compile(r"\((\d{3})\)\s*(\d{3}[-.]?\d{4})")
-_PHONE_DASH = re.compile(r"(\d{3})[-.](\d{3}[-.]?\d{4})")
+_PHONE_NUMBER = re.compile(
+    r"(?<!\d)(?:\+?1[\s.-]?)?\(?(\d{3})\)?[\s.-]*(\d{3})[\s.-]*(\d{4})(?!\d)"
+)
+
+
+def _spell_phone(match: re.Match) -> str:
+    area, prefix, line = match.groups()
+    return (
+        f"<spell>{area}</spell> <break time=\"120ms\" /> "
+        f"<spell>{prefix}</spell> <break time=\"120ms\" /> "
+        f"<spell>{line}</spell>"
+    )
 
 
 def inject_prosody(text: str) -> str:
@@ -62,14 +72,7 @@ def inject_prosody(text: str) -> str:
     if "<spell" in text:
         return text
 
-    text = _PHONE_PAREN.sub(
-        r'<spell>(\1)</spell> <spell>\2</spell>',
-        text,
-    )
-    text = _PHONE_DASH.sub(
-        r'<spell>\1</spell> <spell>\2</spell>',
-        text,
-    )
+    text = _PHONE_NUMBER.sub(_spell_phone, text)
 
     if text != original:
         logger.debug(f"Prosody: {original!r} → {text!r}")

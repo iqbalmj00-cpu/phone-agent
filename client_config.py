@@ -22,11 +22,11 @@ _cache: dict[str, tuple[dict[str, Any], float]] = {}
 CACHE_TTL = 300  # 5 minutes
 
 
-async def get_client_config(client_id: str) -> dict[str, Any]:
+async def get_client_config(client_id: str, force_refresh: bool = False) -> dict[str, Any]:
     """Fetch client config from dashboard, with caching."""
 
     # Check cache
-    if client_id in _cache:
+    if not force_refresh and client_id in _cache:
         config, fetched_at = _cache[client_id]
         if time.time() - fetched_at < CACHE_TTL:
             return config
@@ -44,7 +44,8 @@ async def get_client_config(client_id: str) -> dict[str, Any]:
 
     config = resp.json()
     _cache[client_id] = (config, time.time())
-    logger.info(f"Cached config for {client_id} ({config.get('companyName', 'unknown')})")
+    action = "Refreshed" if force_refresh else "Cached"
+    logger.info(f"{action} config for {client_id} ({config.get('companyName', 'unknown')})")
 
     # Sanity-check critical fields and warn if missing.
     # forwardingPhone is required for transfer_to_human to work. Missing it means

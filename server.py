@@ -12,7 +12,7 @@ Endpoints:
 import asyncio
 import json
 import os
-from xml.sax.saxutils import escape, quoteattr
+from xml.sax.saxutils import quoteattr
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -35,7 +35,9 @@ from config import (
 from client_config import get_client_config
 from bot import run_bot
 from agent.phone_coverage import (
-    build_handoff_twiml,
+    DASHBOARD_ORIGIN_CAPACITY,
+    DASHBOARD_ORIGIN_COVERAGE_OFF,
+    build_dashboard_handoff_redirect_twiml,
     build_no_handoff_twiml,
     resolve_phone_coverage_decision,
 )
@@ -46,6 +48,16 @@ app = FastAPI(title="ScaleYourJunk Phone Agent")
 # ── Concurrent call tracking ────────────────────────────
 _active_calls: dict[str, asyncio.Task] = {}
 _calls_lock = asyncio.Lock()
+_twilio_client = None
+
+
+def _get_twilio_client():
+    """Get or create Twilio REST client for live call redirects."""
+    global _twilio_client
+    if _twilio_client is None:
+        from twilio.rest import Client as TwilioClient
+        _twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    return _twilio_client
 
 
 @app.on_event("startup")
@@ -99,6 +111,38 @@ def _public_base_url(request: Request) -> str:
     return f"{scheme}://{host}"
 
 
+async def _redirect_live_call_to_dashboard_handoff(
+    *,
+    call_sid: str,
+    client_id: str,
+    company_name: str,
+    reason: str,
+    origin: str,
+) -> bool:
+    """Ask Twilio to move an already-connected live call to dashboard handoff."""
+    if not call_sid:
+        return False
+
+    twiml = build_dashboard_handoff_redirect_twiml(
+        company_name=company_name,
+        client_id=client_id,
+        dashboard_url=DASHBOARD_URL,
+        reason=reason,
+        origin=origin,
+    ) or build_no_handoff_twiml(company_name)
+
+    try:
+        client = _get_twilio_client()
+        await asyncio.to_thread(client.calls(call_sid).update, twiml=twiml)
+        return True
+    except Exception as exc:
+        logger.error(
+            f"Failed to redirect live call {call_sid} for client={client_id} "
+            f"reason={reason}: {exc}"
+        )
+        return False
+
+
 @app.post("/twiml/{client_id}")
 async def twiml_webhook(client_id: str, request: Request):
     """Twilio calls this when a number rings. Returns TwiML that
@@ -127,27 +171,23 @@ async def twiml_webhook(client_id: str, request: Request):
         )
     if coverage.should_handoff:
         company = config.get("companyName", "us")
-        base_url = _public_base_url(request)
-        caller_id = config.get("twilioNumber") or to_number
-        handoff_twiml = build_handoff_twiml(
+        handoff_twiml = build_dashboard_handoff_redirect_twiml(
             company_name=company,
-            forwarding_phone=config.get("forwardingPhone"),
-            caller_id=caller_id,
-            base_url=base_url,
             client_id=client_id,
-            call_sid=call_sid,
+            dashboard_url=DASHBOARD_URL,
             reason=coverage.reason,
+            origin=DASHBOARD_ORIGIN_COVERAGE_OFF,
         )
         if handoff_twiml:
             logger.info(
-                f"Phone coverage handoff for {company} ({client_id}): "
+                f"Phone coverage dashboard handoff for {company} ({client_id}): "
                 f"mode={coverage.mode} reason={coverage.reason} call_sid={call_sid or 'missing'}"
             )
             return PlainTextResponse(content=handoff_twiml, media_type="application/xml")
 
         logger.warning(
-            f"Phone coverage required handoff for {company} ({client_id}) but forwardingPhone "
-            f"is missing or invalid; returning safe unavailable TwiML"
+            f"Phone coverage required dashboard handoff for {company} ({client_id}) but DASHBOARD_URL "
+            f"is missing; returning safe unavailable TwiML"
         )
         return PlainTextResponse(content=build_no_handoff_twiml(company), media_type="application/xml")
 
@@ -155,17 +195,20 @@ async def twiml_webhook(client_id: str, request: Request):
     async with _calls_lock:
         if len(_active_calls) >= MAX_CONCURRENT_CALLS:
             company = config.get("companyName", "us")
-            logger.warning(f"Max concurrent calls ({MAX_CONCURRENT_CALLS}) reached at TwiML — returning busy message for {company}")
-            busy_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">
-        Thanks for calling {escape(str(company))}.
-        We're experiencing high call volume right now.
-        Please try again in a few minutes, or visit our website to book online.
-        Thank you!
-    </Say>
-</Response>"""
-            return PlainTextResponse(content=busy_twiml, media_type="application/xml")
+            logger.warning(
+                f"Max concurrent calls ({MAX_CONCURRENT_CALLS}) reached at TwiML for {company}; "
+                "redirecting to dashboard softphone handoff"
+            )
+            capacity_twiml = build_dashboard_handoff_redirect_twiml(
+                company_name=company,
+                client_id=client_id,
+                dashboard_url=DASHBOARD_URL,
+                reason="phone_agent_at_capacity",
+                origin=DASHBOARD_ORIGIN_CAPACITY,
+            )
+            if capacity_twiml:
+                return PlainTextResponse(content=capacity_twiml, media_type="application/xml")
+            return PlainTextResponse(content=build_no_handoff_twiml(company), media_type="application/xml")
 
     # ── Coverage is ON: connect to AI agent ──
     host = request.headers.get("host", "localhost")
@@ -263,15 +306,31 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             return
 
         # ── Check concurrent call limit ──
+        over_capacity = False
         async with _calls_lock:
             if len(_active_calls) >= MAX_CONCURRENT_CALLS:
+                over_capacity = True
+            else:
+                _active_calls[call_id] = None
+
+        if over_capacity:
+            logger.warning(
+                f"Max concurrent calls ({MAX_CONCURRENT_CALLS}) reached. "
+                f"Redirecting live call {call_id} to dashboard softphone handoff"
+            )
+            redirected = await _redirect_live_call_to_dashboard_handoff(
+                call_sid=call_id,
+                client_id=client_id,
+                company_name="our team",
+                reason="phone_agent_at_capacity",
+                origin=DASHBOARD_ORIGIN_CAPACITY,
+            )
+            if not redirected:
                 logger.warning(
-                    f"Max concurrent calls ({MAX_CONCURRENT_CALLS}) reached. "
-                    f"Rejecting call {call_id}"
+                    f"Could not redirect at-capacity live call {call_id}; closing websocket"
                 )
-                await websocket.close()
-                return
-            _active_calls[call_id] = None
+            await websocket.close()
+            return
 
         # ── Fetch client config ──
         try:

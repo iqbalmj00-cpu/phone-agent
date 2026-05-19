@@ -22,8 +22,6 @@ import time
 import aiohttp
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import quote
-from xml.sax.saxutils import escape, quoteattr
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -34,6 +32,7 @@ from agent.business_hours import (
     is_business_hours as _shared_is_business_hours,
     is_open_day as _shared_is_open_day,
 )
+from agent.phone_coverage import DASHBOARD_ORIGIN_AI_TRANSFER, build_dashboard_handoff_redirect_twiml
 from agent.prompt import client_supports_dumpsters
 from client_config import get_client_config
 from config import DASHBOARD_URL, INGEST_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, GOOGLE_MAPS_API_KEY
@@ -49,6 +48,7 @@ _terminal_transfer_states: dict[str, dict[str, Any]] = {}
 _TRANSFER_SUCCESS_STATUSES = {"completed", "answered"}
 _TRANSFER_FAILURE_STATUSES = {"busy", "no-answer", "failed", "canceled"}
 _TRANSFER_TERMINAL_STATUSES = {"completed", "failed", "unavailable_no_forwarding_phone"}
+PENDING_TRANSFER_TTL_SECONDS = 60 * 60
 _TRANSFER_REASON_LABELS = {
     "phone_coverage_off": "AI phone coverage is outside configured answering hours",
     "phone_coverage_always_handoff": "AI phone coverage is set to always handoff",
@@ -94,6 +94,22 @@ def set_pipeline_task(call_sid: str, task):
     """Store the PipelineTask so handlers can cancel it (e.g. after transfer)."""
     if call_sid in _call_contexts:
         _call_contexts[call_sid]["pipeline_task"] = task
+
+
+def mark_dashboard_transfer_ownership(call_sid: str, origin: str, reason: str | None = None):
+    """Record that dashboard Twilio routes own the final transfer result."""
+    if call_sid not in _call_contexts:
+        return
+    _call_contexts[call_sid]["dashboard_owns_transfer_result"] = True
+    _call_contexts[call_sid]["dashboard_transfer_origin"] = origin
+    _call_contexts[call_sid]["transfer_status"] = "dashboard_redirected"
+    if reason is not None:
+        _call_contexts[call_sid]["transfer_reason"] = reason
+
+
+def is_dashboard_owned_transfer(call_sid: str) -> bool:
+    """Return True once a live call has been redirected to dashboard handoff."""
+    return bool(_call_contexts.get(call_sid, {}).get("dashboard_owns_transfer_result"))
 
 
 def is_booking_complete(call_sid: str) -> bool:
@@ -223,11 +239,15 @@ def _remember_pending_transfer(
     reason: str,
 ):
     """Keep enough context to update the dashboard when Twilio reports Dial status."""
+    prune_stale_pending_transfers()
+    now = time.time()
     _pending_transfers[call_sid] = {
         "config": dict(config),
         "from_number": from_number,
         "to_number": config.get("twilioNumber", ""),
         "reason": reason,
+        "created_at": now,
+        "updated_at": now,
         "transfer_status": "requested",
         "duration": 0,
         "summary": "",
@@ -249,6 +269,7 @@ def _update_pending_transfer_status(
     if not pending:
         return
     pending["transfer_status"] = status
+    pending["updated_at"] = time.time()
     if callback_requested:
         pending["callback_requested"] = True
 
@@ -286,14 +307,42 @@ def update_pending_transfer_snapshot(
 
 
 def get_pending_transfer_state(call_sid: str) -> dict[str, Any]:
+    prune_stale_pending_transfers()
     pending = _pending_transfers.get(call_sid)
     return dict(pending) if pending else {}
+
+
+def clear_pending_transfer(call_sid: str):
+    _pending_transfers.pop(call_sid, None)
+
+
+def prune_stale_pending_transfers(
+    *,
+    now: float | None = None,
+    ttl_seconds: int = PENDING_TRANSFER_TTL_SECONDS,
+) -> int:
+    """Drop old legacy transfer records that never received a terminal callback."""
+    current = time.time() if now is None else now
+    cutoff = current - max(0, ttl_seconds)
+    removed = 0
+    for pending_call_sid, pending in list(_pending_transfers.items()):
+        timestamp = pending.get("updated_at") or pending.get("created_at") or 0
+        try:
+            transfer_time = float(timestamp)
+        except (TypeError, ValueError):
+            transfer_time = 0
+        if transfer_time < cutoff:
+            _pending_transfers.pop(pending_call_sid, None)
+            removed += 1
+    if removed:
+        logger.info(f"Pruned {removed} stale pending transfer record(s)")
+    return removed
 
 
 def clear_pending_transfer_if_terminal(call_sid: str):
     pending = _pending_transfers.get(call_sid)
     if pending and pending.get("terminal_logged"):
-        _pending_transfers.pop(call_sid, None)
+        clear_pending_transfer(call_sid)
 
 
 def mark_sms_consent(call_sid: str, consented: bool):
@@ -2032,42 +2081,18 @@ async def handle_schedule_callback(params: FunctionCallParams):
 # ── Human Handoff ──────────────────────────────────────
 
 async def handle_transfer_to_human(params: FunctionCallParams):
-    """Transfer the live call to the client's forwarding phone number.
+    """Transfer the live call to the dashboard human handoff route.
 
-    Uses Twilio's REST API to update the active call with <Dial> TwiML,
-    which redirects the caller to the client's number. The AI pipeline
-    is then cancelled since the call audio stream will end.
-
-    Requires 'forwardingPhone' in the client config (set via dashboard).
+    Uses Twilio's REST API to update the active call with <Redirect> TwiML.
+    The dashboard rings registered softphone users first and falls back to
+    the handoff phone if the dashboard does not answer.
     """
     config = _get_config()
     ctx = _get_context()
     reason = params.arguments.get("reason", "Caller requested human agent")
     call_sid = ctx.get("call_sid")
-    forwarding_phone = config.get("forwardingPhone", "")
     if call_sid:
         mark_transfer_state(call_sid, "requested", reason)
-
-    # No forwarding number configured — take a message instead
-    normalized_forwarding_phone = _normalize_e164_phone(forwarding_phone)
-    if not normalized_forwarding_phone:
-        logger.warning(f"No valid forwardingPhone configured — cannot transfer call {call_sid}")
-        if call_sid:
-            mark_transfer_state(
-                call_sid,
-                "unavailable_no_forwarding_phone",
-                reason,
-                callback_requested=True,
-            )
-        await params.result_callback({
-            "transferred": False,
-            "message": (
-                "I'm not able to transfer you right now, but I've noted your request. "
-                "Someone from our team will call you back shortly. "
-                "Is there anything else I can help you with in the meantime?"
-            ),
-        })
-        return
 
     if not call_sid:
         logger.error("No call_sid in context — cannot transfer")
@@ -2077,47 +2102,24 @@ async def handle_transfer_to_human(params: FunctionCallParams):
         })
         return
 
-    # Build TwiML to redirect the call
+    # Build TwiML to redirect the live call back to the dashboard router.
     company_name = config.get("companyName", "our team")
-    base_url = str(config.get("_phoneAgentBaseUrl") or "").rstrip("/")
     client_id = str(config.get("_clientId") or "unknown")
-    action_url = ""
-    if base_url:
-        action_url = (
-            f"{base_url}/transfer-status/"
-            f"{quote(client_id, safe='')}/{quote(call_sid, safe='')}"
-        )
-    else:
-        logger.warning(f"No phone-agent public base URL available for transfer status callback on call {call_sid}")
-
-    dial_attrs = ['timeout="25"']
-    twilio_number = config.get("twilioNumber", "")
-    if twilio_number:
-        dial_attrs.append(f"callerId={quoteattr(str(twilio_number))}")
-    if action_url:
-        dial_attrs.append(f"action={quoteattr(action_url)}")
-        dial_attrs.append('method="POST"')
-    dial_attr_str = " ".join(dial_attrs)
-    if call_sid:
-        _remember_pending_transfer(
-            call_sid,
-            config,
-            ctx.get("caller_number", ""),
-            reason,
-        )
-
-    post_dial_fallback = (
-        ""
-        if action_url
-        else '<Say voice="Polly.Joanna">We were unable to reach anyone at this time. We have marked this for a callback. Goodbye.</Say>'
+    transfer_twiml = build_dashboard_handoff_redirect_twiml(
+        company_name=company_name,
+        dashboard_url=DASHBOARD_URL,
+        client_id=client_id,
+        reason=str(reason),
+        origin=DASHBOARD_ORIGIN_AI_TRANSFER,
     )
-    transfer_twiml = (
-        f'<Response>'
-        f'<Say voice="Polly.Joanna">Please hold while we connect you with {escape(str(company_name))}.</Say>'
-        f'<Dial {dial_attr_str}>{escape(normalized_forwarding_phone)}</Dial>'
-        f'{post_dial_fallback}'
-        f'</Response>'
-    )
+    if not transfer_twiml:
+        logger.error(f"No dashboard transfer URL available — cannot transfer call {call_sid}")
+        mark_transfer_state(call_sid, "failed", reason, callback_requested=True)
+        await params.result_callback({
+            "transferred": False,
+            "message": "I'm having trouble with the transfer right now. Let me take your info and have someone call you back within the hour.",
+        })
+        return
 
     try:
         # Twilio SDK is synchronous — run in thread executor
@@ -2127,23 +2129,22 @@ async def handle_transfer_to_human(params: FunctionCallParams):
             twiml=transfer_twiml,
         )
 
-        logger.info(f"Call {call_sid} transferred to {normalized_forwarding_phone} (reason: {reason})")
+        logger.info(f"Call {call_sid} redirected to dashboard human handoff (reason: {reason})")
 
-        # Twilio accepting the redirect only means dialing started. The final
-        # completed/failed state comes later from the <Dial action> callback.
+        # Dashboard Twilio routes own the final softphone/handoff result from
+        # this point forward. Do not write legacy phone-agent transfer updates
+        # that can downgrade dashboard_answered/handoff_answered later.
         if ctx.get("call_sid"):
-            mark_transfer_state(ctx["call_sid"], "dialing", reason)
-            _update_pending_transfer_status(ctx["call_sid"], "dialing")
-            await _log_interim_transfer_requested(
-                call_sid=ctx["call_sid"],
-                config=config,
-                from_number=ctx.get("caller_number", ""),
-                reason=reason,
+            mark_dashboard_transfer_ownership(
+                ctx["call_sid"],
+                DASHBOARD_ORIGIN_AI_TRANSFER,
+                reason=str(reason),
             )
+            clear_pending_transfer(ctx["call_sid"])
 
         await params.result_callback({
             "transferred": True,
-            "transferStatus": "dialing",
+            "transferStatus": "dashboard_redirected",
             "message": "Transferring the call now.",
         })
 

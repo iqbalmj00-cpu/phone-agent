@@ -47,14 +47,14 @@ async def get_client_config(client_id: str, force_refresh: bool = False) -> dict
     action = "Refreshed" if force_refresh else "Cached"
     logger.info(f"{action} config for {client_id} ({config.get('companyName', 'unknown')})")
 
-    # Sanity-check critical fields and warn if missing.
-    # forwardingPhone is required for transfer_to_human to work. Missing it means
-    # callers asking for a human will fall back to a callback request instead of
-    # being transferred live.
+    # Sanity-check handoff fallback fields and warn if missing. Human transfer
+    # now goes to dashboard softphones first; forwardingPhone is the final
+    # fallback if the dashboard does not answer.
     if not config.get("forwardingPhone"):
-        logger.critical(
+        logger.warning(
             f"forwardingPhone MISSING for client {client_id} "
-            f"({config.get('companyName', 'unknown')}) — human handoff will fail. "
+            f"({config.get('companyName', 'unknown')}) — dashboard softphone can still ring, "
+            f"but phone fallback will create a callback if no dashboard user answers. "
             f"Operator must set this in dashboard settings."
         )
 

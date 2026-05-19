@@ -95,6 +95,8 @@ from agent.handlers import (
     get_inflight_tasks,
     update_pending_transfer_snapshot,
     get_pending_transfer_state,
+    is_dashboard_owned_transfer,
+    clear_pending_transfer,
     clear_pending_transfer_if_terminal,
     _current_call_sid,
 )
@@ -116,6 +118,12 @@ CARTESIA_SPEED_PRESETS = {
     "fast": 1.08,
     "fastest": 1.15,
 }
+
+
+def should_write_final_call_log(call_id: str) -> bool:
+    """Final phone-agent logs must not overwrite dashboard-owned transfer results."""
+    return not is_dashboard_owned_transfer(call_id)
+
 
 async def _delayed_followup_sms(caller_number: str, config: dict, delay_seconds: int = FOLLOWUP_DELAY_SECONDS):
     """Wait, then send automated follow-up SMS to callers who didn't book."""
@@ -810,6 +818,7 @@ async def run_bot(
         transfer_state = get_transfer_state(call_id)
         booking_log_state = get_booking_log_state(call_id)
         sms_consented = has_sms_consent(call_id)
+        dashboard_owned_transfer = not should_write_final_call_log(call_id)
         transfer_status = transfer_state.get("transfer_status")
         callback_requested = bool(transfer_state.get("callback_requested"))
         pending_transfer = get_pending_transfer_state(call_id)
@@ -834,19 +843,20 @@ async def run_bot(
         caller_name = str(booking_log_state.get("caller_name") or "")
         appointment_date = str(booking_log_state.get("appointment_date") or "")
 
-        update_pending_transfer_snapshot(
-            call_id,
-            duration=duration_s,
-            summary=summary or "",
-            from_number=saved_caller or "",
-            to_number=saved_twilio_number,
-            config=saved_config,
-            sms_consent=sms_consented,
-            callback_requested=callback_requested,
-            callback_due_at=transfer_state.get("callback_due_at"),
-            caller_name=caller_name,
-            appointment_date=appointment_date,
-        )
+        if not dashboard_owned_transfer:
+            update_pending_transfer_snapshot(
+                call_id,
+                duration=duration_s,
+                summary=summary or "",
+                from_number=saved_caller or "",
+                to_number=saved_twilio_number,
+                config=saved_config,
+                sms_consent=sms_consented,
+                callback_requested=callback_requested,
+                callback_due_at=transfer_state.get("callback_due_at"),
+                caller_name=caller_name,
+                appointment_date=appointment_date,
+            )
 
         latest_pending_transfer = get_pending_transfer_state(call_id)
         if latest_pending_transfer.get("terminal_logged"):
@@ -856,30 +866,37 @@ async def run_bot(
                 summary = latest_pending_transfer["summary"]
             outcome = "callback_requested" if callback_requested or transfer_status == "failed" else "transferred"
 
-        # Log call to dashboard and wait briefly so the process cannot exit before
-        # the POST is sent. Dashboard returns 201 on create and 200 on duplicate update.
-        try:
-            await asyncio.wait_for(
-                log_call_to_dashboard(
-                    config=saved_config,
-                    twilio_call_sid=call_id,
-                    from_number=saved_caller or "",
-                    to_number=saved_twilio_number,
-                    duration=duration_s,
-                    outcome=outcome,
-                    summary=summary or "",
-                    caller_name=caller_name,
-                    appointment_date=appointment_date,
-                    sms_consent=sms_consented,
-                    transfer_reason=transfer_state.get("transfer_reason"),
-                    transfer_status=transfer_status,
-                    callback_requested=callback_requested,
-                    callback_due_at=transfer_state.get("callback_due_at"),
-                ),
-                timeout=CALL_LOG_WAIT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"Timed out logging call {call_id} to dashboard")
+        # Dashboard-routed transfers are finalized by dashboard Twilio callbacks.
+        # A normal phone-agent call-log update here can arrive late and downgrade
+        # dashboard_answered/handoff_answered back to requested/dialing.
+        if dashboard_owned_transfer:
+            logger.info(f"Skipping phone-agent final call log for dashboard-owned transfer {call_id}")
+            clear_pending_transfer(call_id)
+        else:
+            # Log call to dashboard and wait briefly so the process cannot exit before
+            # the POST is sent. Dashboard returns 201 on create and 200 on duplicate update.
+            try:
+                await asyncio.wait_for(
+                    log_call_to_dashboard(
+                        config=saved_config,
+                        twilio_call_sid=call_id,
+                        from_number=saved_caller or "",
+                        to_number=saved_twilio_number,
+                        duration=duration_s,
+                        outcome=outcome,
+                        summary=summary or "",
+                        caller_name=caller_name,
+                        appointment_date=appointment_date,
+                        sms_consent=sms_consented,
+                        transfer_reason=transfer_state.get("transfer_reason"),
+                        transfer_status=transfer_status,
+                        callback_requested=callback_requested,
+                        callback_due_at=transfer_state.get("callback_due_at"),
+                    ),
+                    timeout=CALL_LOG_WAIT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Timed out logging call {call_id} to dashboard")
 
         clear_pending_transfer_if_terminal(call_id)
 
@@ -887,7 +904,7 @@ async def run_bot(
         clear_call_context(call_id)
 
         # Schedule automated follow-up SMS only if consent was explicitly given
-        if not booked and saved_caller and sms_consented is True:
+        if not booked and not dashboard_owned_transfer and saved_caller and sms_consented is True:
             asyncio.create_task(
                 _delayed_followup_sms(saved_caller, saved_config, delay_seconds=300)
             )

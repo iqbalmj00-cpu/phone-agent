@@ -20,6 +20,9 @@ from agent.business_hours import is_currently_within_business_hours, parse_hhmm
 SHORT_DAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
 LONG_DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
 VALID_COVERAGE_MODES = {"business_hours", "custom_hours", "always_on", "always_handoff"}
+DASHBOARD_ORIGIN_AI_TRANSFER = "phone_agent_ai_transfer"
+DASHBOARD_ORIGIN_CAPACITY = "phone_agent_capacity"
+DASHBOARD_ORIGIN_COVERAGE_OFF = "phone_agent_coverage_off"
 
 
 @dataclass(frozen=True)
@@ -222,6 +225,38 @@ def build_transfer_status_action_url(
     )
     query = urlencode({"reason": reason}) if reason else ""
     return f"{path}?{query}" if query else path
+
+
+def build_dashboard_handoff_redirect_twiml(
+    *,
+    company_name: Any,
+    dashboard_url: str,
+    client_id: str,
+    reason: str = "phone_coverage_off",
+    origin: str = "",
+) -> str | None:
+    if not dashboard_url or not client_id:
+        return None
+
+    path = (
+        f"{dashboard_url.rstrip('/')}/api/voice/twilio/agent-transfer/"
+        f"{quote(str(client_id), safe='')}"
+    )
+    query_params = {}
+    if reason:
+        query_params["reason"] = reason
+    if origin:
+        query_params["origin"] = origin
+    query = urlencode(query_params) if query_params else ""
+    redirect_url = f"{path}?{query}" if query else path
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Say voice="Polly.Joanna">Please hold while we connect you with {escape(str(company_name or "our team"))}.</Say>'
+        f'<Redirect method="POST">{escape(redirect_url)}</Redirect>'
+        "</Response>"
+    )
 
 
 def build_handoff_twiml(

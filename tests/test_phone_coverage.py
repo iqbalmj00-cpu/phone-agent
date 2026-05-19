@@ -3,6 +3,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from agent.phone_coverage import (
+    DASHBOARD_ORIGIN_AI_TRANSFER,
+    build_dashboard_handoff_redirect_twiml,
     build_handoff_twiml,
     build_no_handoff_twiml,
     evaluate_weekly_hours,
@@ -106,6 +108,24 @@ class PhoneCoverageTests(unittest.TestCase):
         self.assertIn("+15551234567", twiml)
         self.assertIn('callerId="+15559990000"', twiml)
         self.assertIn("/transfer-status/client%2Fid/CA%2F123?reason=phone_coverage_off", twiml)
+
+    def test_dashboard_handoff_redirect_twiml_uses_dashboard_agent_transfer(self):
+        twiml = build_dashboard_handoff_redirect_twiml(
+            company_name="A&B Junk",
+            dashboard_url="https://dashboard.example.com",
+            client_id="client/id",
+            reason="phone_coverage_off",
+            origin=DASHBOARD_ORIGIN_AI_TRANSFER,
+        )
+        self.assertIsNotNone(twiml)
+        assert twiml is not None
+        self.assertIn("A&amp;B Junk", twiml)
+        self.assertIn("<Redirect", twiml)
+        self.assertIn(
+            "/api/voice/twilio/agent-transfer/client%2Fid?reason=phone_coverage_off&amp;origin=phone_agent_ai_transfer",
+            twiml,
+        )
+        self.assertNotIn("<Dial", twiml)
 
     def test_handoff_twiml_without_call_sid_has_post_dial_fallback(self):
         twiml = build_handoff_twiml(

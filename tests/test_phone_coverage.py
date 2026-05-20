@@ -35,19 +35,21 @@ class PhoneCoverageTests(unittest.TestCase):
         self.assertTrue(decision.should_handoff)
         self.assertEqual(decision.reason, "phone_coverage_always_handoff")
 
-    def test_business_hours_uses_client_timezone(self):
+    def test_business_hours_mode_answers_after_hours_only(self):
         config = {
             "phoneCoverageMode": "business_hours",
             "timezone": "America/Los_Angeles",
             "businessHours": WEEKLY_HOURS,
         }
         inside = datetime(2026, 5, 18, 15, 30, tzinfo=ZoneInfo("UTC"))  # Monday 8:30 AM Pacific
-        outside = datetime(2026, 5, 18, 23, 30, tzinfo=ZoneInfo("UTC"))  # Monday 4:30 PM Pacific
-        self.assertTrue(resolve_phone_coverage_decision(config, inside).should_answer_ai)
-        self.assertTrue(resolve_phone_coverage_decision(config, outside).should_answer_ai)
+        near_close = datetime(2026, 5, 18, 23, 30, tzinfo=ZoneInfo("UTC"))  # Monday 4:30 PM Pacific
+        self.assertTrue(resolve_phone_coverage_decision(config, inside).should_handoff)
+        self.assertTrue(resolve_phone_coverage_decision(config, near_close).should_handoff)
 
         after_close = datetime(2026, 5, 19, 1, 30, tzinfo=ZoneInfo("UTC"))  # Monday 6:30 PM Pacific
-        self.assertTrue(resolve_phone_coverage_decision(config, after_close).should_handoff)
+        decision = resolve_phone_coverage_decision(config, after_close)
+        self.assertTrue(decision.should_answer_ai)
+        self.assertEqual(decision.reason, "phone_coverage_after_hours_on")
 
     def test_custom_hours_inside_and_outside(self):
         config = {

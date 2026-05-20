@@ -1,8 +1,8 @@
 """AI phone coverage routing helpers.
 
-This module is intentionally separate from business-hours booking logic. Business
-hours can be used as AI coverage only when the dashboard explicitly resolves the
-runtime mode to ``business_hours``.
+This module is intentionally separate from business-hours booking logic. The
+dashboard resolves ``business_hours`` as after-hours AI coverage: AI answers
+outside configured business hours and hands off during business hours.
 """
 
 from __future__ import annotations
@@ -196,9 +196,9 @@ def resolve_phone_coverage_decision(config: dict[str, Any], now: datetime | None
                 f"Could not evaluate business hours: {exc}",
             )
         return (
-            _answer_ai(mode, "phone_coverage_business_hours_on")
+            _handoff(mode, "phone_coverage_off")
             if within_hours
-            else _handoff(mode, "phone_coverage_off")
+            else _answer_ai(mode, "phone_coverage_after_hours_on")
         )
 
     evaluation = evaluate_weekly_hours(config.get("phoneCoverageHours"), config.get("timezone"), current)

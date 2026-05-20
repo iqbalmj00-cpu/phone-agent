@@ -63,16 +63,25 @@ class TwimlCoverageRouteTests(unittest.TestCase):
         self.assertIn("origin=phone_agent_coverage_off", response.text)
         self.assertNotIn("<Stream", response.text)
 
-    def test_business_hours_off_redirects_to_dashboard_handoff(self):
+    def test_business_hours_mode_during_hours_redirects_to_dashboard_handoff(self):
         config = copy.deepcopy(BASE_CONFIG)
         config["phoneCoverageMode"] = "business_hours"
-        config["businessHours"] = CLOSED_ALL_WEEK
+        config["businessHours"] = OPEN_ALL_WEEK
         response = self._post_twiml(config)
         self.assertEqual(response.status_code, 200)
         self.assertIn("<Redirect", response.text)
         self.assertIn("https://dashboard.example.com/api/voice/twilio/agent-transfer/client-1", response.text)
         self.assertIn("reason=phone_coverage_off", response.text)
         self.assertIn("origin=phone_agent_coverage_off", response.text)
+
+    def test_business_hours_mode_after_hours_returns_stream_twiml(self):
+        config = copy.deepcopy(BASE_CONFIG)
+        config["phoneCoverageMode"] = "business_hours"
+        config["businessHours"] = CLOSED_ALL_WEEK
+        response = self._post_twiml(config)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("<Stream", response.text)
+        self.assertNotIn("<Dial", response.text)
 
     def test_custom_hours_on_returns_stream_twiml(self):
         config = copy.deepcopy(BASE_CONFIG)

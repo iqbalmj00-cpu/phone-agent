@@ -50,7 +50,7 @@ _TRANSFER_FAILURE_STATUSES = {"busy", "no-answer", "failed", "canceled"}
 _TRANSFER_TERMINAL_STATUSES = {"completed", "failed", "unavailable_no_forwarding_phone"}
 PENDING_TRANSFER_TTL_SECONDS = 60 * 60
 _TRANSFER_REASON_LABELS = {
-    "phone_coverage_off": "AI phone coverage is outside configured answering hours",
+    "phone_coverage_off": "AI phone coverage is off for the current time",
     "phone_coverage_always_handoff": "AI phone coverage is set to always handoff",
     "phone_coverage_missing_mode": "AI phone coverage mode was missing from dashboard config",
     "phone_coverage_unresolved_plan_default": "dashboard returned unresolved plan_default phone coverage mode",

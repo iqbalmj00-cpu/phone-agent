@@ -33,6 +33,7 @@ from agent.business_hours import (
     is_open_day as _shared_is_open_day,
 )
 from agent.phone_coverage import DASHBOARD_ORIGIN_AI_TRANSFER, build_dashboard_handoff_redirect_twiml
+from agent.prosody import format_address_for_speech
 from agent.prompt import client_supports_dumpsters
 from client_config import get_client_config
 from config import DASHBOARD_URL, INGEST_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, GOOGLE_MAPS_API_KEY
@@ -489,6 +490,7 @@ def remember_address_verification(
     call_sid: str,
     raw_address: str,
     formatted_address: str,
+    spoken_address: str,
     service_area_status: str,
     reason: str,
 ):
@@ -499,6 +501,7 @@ def remember_address_verification(
     record = {
         "raw_address": raw_address,
         "formatted_address": formatted_address,
+        "spoken_address": spoken_address,
         "service_area_status": service_area_status,
         "reason": reason,
     }
@@ -527,6 +530,14 @@ def get_address_verification(call_sid: str, address: str) -> dict[str, Any] | No
     return None
 
 
+def resolve_booking_address(call_sid: str, address: str) -> tuple[str, dict[str, Any] | None]:
+    """Return the canonical verified address for booking when available."""
+    verification = get_address_verification(call_sid, address) if call_sid else None
+    if verification and verification.get("formatted_address"):
+        return str(verification["formatted_address"]), verification
+    return address, verification
+
+
 def _component_long_short(result: dict[str, Any], component_type: str) -> tuple[str, str]:
     for component in result.get("address_components", []):
         if component_type in component.get("types", []):
@@ -535,6 +546,8 @@ def _component_long_short(result: dict[str, Any], component_type: str) -> tuple[
 
 
 def _extract_geocode_components(result: dict[str, Any]) -> dict[str, str]:
+    street_number = _component_long_short(result, "street_number")[0]
+    route = _component_long_short(result, "route")[0]
     city = (
         _component_long_short(result, "locality")[0]
         or _component_long_short(result, "postal_town")[0]
@@ -545,6 +558,8 @@ def _extract_geocode_components(result: dict[str, Any]) -> dict[str, str]:
     county = _component_long_short(result, "administrative_area_level_2")[0]
     postal_code = _component_long_short(result, "postal_code")[0]
     return {
+        "street_number": street_number,
+        "route": route,
         "city": city,
         "state": state_short or state_long,
         "state_long": state_long,
@@ -555,6 +570,64 @@ def _extract_geocode_components(result: dict[str, Any]) -> dict[str, str]:
 
 def _normalize_place(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+_ZIP_RE = re.compile(r"\b\d{5}(?:-\d{4})?\b")
+_HOUSE_NUMBER_RE = re.compile(r"\b\d{1,6}\b")
+
+
+def _contains_house_number(address: str) -> bool:
+    return bool(_HOUSE_NUMBER_RE.search(address or ""))
+
+
+def _address_has_location_context(address: str, config: dict[str, Any]) -> bool:
+    if _ZIP_RE.search(address or ""):
+        return True
+
+    normalized = f" {_normalize_place(address)} "
+    city = _normalize_place(str(config.get("city") or ""))
+    if city and f" {city} " in normalized:
+        return True
+
+    state_variants = _state_variants(str(config.get("state") or ""))
+    if any(f" {variant} " in normalized for variant in state_variants):
+        return True
+
+    for token in _service_area_tokens(config):
+        if f" {token} " in normalized:
+            return True
+
+    return False
+
+
+def _primary_address_lookup_place(config: dict[str, Any]) -> str:
+    city = str(config.get("city") or "").strip()
+    state = str(config.get("state") or "").strip()
+    if city and state:
+        return f"{city}, {state}"
+    if city:
+        return city
+    if state:
+        return state
+
+    for token in _service_area_tokens(config):
+        if not any(term in token.split() for term in {"area", "nearby", "surrounding", "greater"}):
+            return token.title()
+    return ""
+
+
+def build_geocode_query(address: str, config: dict[str, Any]) -> tuple[str, bool]:
+    """Append tenant city/state to partial street addresses before geocoding."""
+    cleaned = re.sub(r"\s+", " ", (address or "").strip())
+    if not cleaned:
+        return "", False
+
+    if _contains_house_number(cleaned) and not _address_has_location_context(cleaned, config):
+        place = _primary_address_lookup_place(config)
+        if place:
+            return f"{cleaned}, {place}", True
+
+    return cleaned, False
 
 
 _US_STATE_TO_ABBR = {
@@ -1423,7 +1496,7 @@ async def handle_create_booking(params: FunctionCallParams):
         })
         return
 
-    address_verification = get_address_verification(call_sid, address) if call_sid else None
+    address, address_verification = resolve_booking_address(call_sid, address)
     if address_verification and address_verification.get("service_area_status") == "out_of_area":
         await params.result_callback({
             "fallback": True,
@@ -1839,6 +1912,14 @@ async def handle_verify_address(params: FunctionCallParams):
         })
         return
 
+    if not _contains_house_number(address):
+        await params.result_callback({
+            "verified": False,
+            "error": "street_number_required",
+            "message": "Ask the caller for the street number, then verify the full street address again."
+        })
+        return
+
     if not GOOGLE_MAPS_API_KEY:
         await params.result_callback({
             "verified": False,
@@ -1847,10 +1928,20 @@ async def handle_verify_address(params: FunctionCallParams):
         return
 
     try:
+        lookup_query, added_location_context = build_geocode_query(address, config)
+        geocode_params = {
+            "address": lookup_query,
+            "key": GOOGLE_MAPS_API_KEY,
+            "region": "us",
+        }
+        state = str(config.get("state") or "").strip()
+        if state:
+            geocode_params["components"] = f"country:US|administrative_area:{state}"
+
         async with aiohttp.ClientSession() as http:
             resp = await http.get(
                 "https://maps.googleapis.com/maps/api/geocode/json",
-                params={"address": address, "key": GOOGLE_MAPS_API_KEY},
+                params=geocode_params,
                 timeout=aiohttp.ClientTimeout(total=5),
             )
             data = await resp.json()
@@ -1862,32 +1953,57 @@ async def handle_verify_address(params: FunctionCallParams):
                 # Strip ", USA" or ", US" suffix for cleaner readback
                 formatted = formatted.replace(", USA", "").replace(", US", "")
                 components = _extract_geocode_components(result)
+                if not components.get("street_number") or not components.get("route"):
+                    await params.result_callback({
+                        "verified": False,
+                        "error": "street_number_required",
+                        "message": "I found the street, but not a specific service address. Ask the caller for the full address including the street number."
+                    })
+                    return
+                if not components.get("postal_code"):
+                    await params.result_callback({
+                        "verified": False,
+                        "error": "postal_code_missing",
+                        "message": "I found the address, but not a ZIP code. Ask the caller to confirm the city and ZIP code before booking."
+                    })
+                    return
+
+                spoken_address = format_address_for_speech(formatted)
                 area_status, area_reason = _assess_service_area(components, config)
                 if call_sid:
                     remember_address_verification(
                         call_sid,
                         address,
                         formatted,
+                        spoken_address,
                         area_status,
                         area_reason,
                     )
 
                 if area_status == "out_of_area":
                     message = (
-                        f"Verified address: {formatted}. This appears to be outside the configured service area. "
+                        f"Verified address: {formatted}. Spoken readback: {spoken_address}. "
+                        "This appears to be outside the configured service area. "
                         "Do not book it automatically; offer to transfer the caller to the team to confirm coverage."
                     )
                 elif area_status == "uncertain":
                     message = (
-                        f"Verified address: {formatted}. Read this back to the caller and ask if it's correct. "
+                        f"Verified address: {formatted}. Spoken readback: {spoken_address}. "
+                        "Read the spoken readback to the caller and ask if it's correct. "
                         "Service-area coverage is not fully proven from the configured area text, so transfer if the caller asks whether that location is covered."
                     )
                 else:
-                    message = f"Verified address: {formatted}. Read this back to the caller and ask if it's correct."
+                    message = (
+                        f"Verified address: {formatted}. Spoken readback: {spoken_address}. "
+                        "Read the spoken readback to the caller and ask if it's correct."
+                    )
 
                 await params.result_callback({
                     "verified": True,
                     "formatted_address": formatted,
+                    "spoken_address": spoken_address,
+                    "lookup_query": lookup_query,
+                    "added_location_context": added_location_context,
                     "city": components.get("city"),
                     "state": components.get("state"),
                     "postal_code": components.get("postal_code"),

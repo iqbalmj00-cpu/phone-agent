@@ -502,7 +502,7 @@ def build_tools(dumpster_enabled: bool) -> ToolsSchema:
         ),
         FunctionSchema(
             name="verify_address",
-            description="Verify and normalize a service address using Google Maps. Call this after the caller gives their address to confirm it's correct. Read back the verified address and ask the caller to confirm.",
+            description="Verify and normalize a service address using Google Maps. Call this after the caller gives their address; if they only gave a street number and street name, the tool will use the client's city/state context. Read back spoken_address and use formatted_address for booking.",
             properties={
                 "address": {"type": "string", "description": "The address as spoken by the caller, including street, city, and state if provided"},
             },

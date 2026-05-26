@@ -10,7 +10,7 @@ ENDPOINT MAPPING (dashboard ↔ phone agent):
   - reschedule            → POST /api/agent/reschedule        (X-AGENT-SECRET auth)
   - cancel                → POST /api/agent/cancel            (X-AGENT-SECRET auth)
   - schedule_callback     → POST /api/agent/schedule-callback (X-AGENT-SECRET auth)
-  - transfer_to_human     → Twilio REST API (call redirect)
+  - transfer_to_human     → POST /api/agent/voice/redirect-live-call (x-api-key auth)
   - validate_promo_code   → GET  /api/promo/validate          (x-api-key + x-site-token)
 """
 
@@ -32,11 +32,19 @@ from agent.business_hours import (
     is_business_hours as _shared_is_business_hours,
     is_open_day as _shared_is_open_day,
 )
-from agent.phone_coverage import DASHBOARD_ORIGIN_AI_TRANSFER, build_dashboard_handoff_redirect_twiml
+from agent.dashboard_redirect import redirect_live_call_via_dashboard
+from agent.phone_coverage import DASHBOARD_ORIGIN_AI_TRANSFER
 from agent.prosody import format_address_for_speech
 from agent.prompt import client_supports_dumpsters
 from client_config import get_client_config
-from config import DASHBOARD_URL, INGEST_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, GOOGLE_MAPS_API_KEY
+from config import (
+    DASHBOARD_URL,
+    GOOGLE_MAPS_API_KEY,
+    INGEST_API_KEY,
+    PLATFORM_API_KEY,
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN,
+)
 
 # ── Per-call context — keyed by call_sid for concurrency safety ──
 _call_contexts: dict[str, dict[str, Any]] = {}
@@ -2199,9 +2207,10 @@ async def handle_schedule_callback(params: FunctionCallParams):
 async def handle_transfer_to_human(params: FunctionCallParams):
     """Transfer the live call to the dashboard human handoff route.
 
-    Uses Twilio's REST API to update the active call with <Redirect> TwiML.
-    The dashboard rings registered softphone users first and falls back to
-    the handoff phone if the dashboard does not answer.
+    Asks the dashboard to update the active call because launched clients may
+    use Twilio subaccounts that the phone-agent parent credentials do not own.
+    The dashboard rings registered softphone users first and falls back to the
+    handoff phone if the dashboard does not answer.
     """
     config = _get_config()
     ctx = _get_context()
@@ -2218,34 +2227,29 @@ async def handle_transfer_to_human(params: FunctionCallParams):
         })
         return
 
-    # Build TwiML to redirect the live call back to the dashboard router.
     company_name = config.get("companyName", "our team")
     client_id = str(config.get("_clientId") or "unknown")
-    transfer_twiml = build_dashboard_handoff_redirect_twiml(
-        company_name=company_name,
-        dashboard_url=DASHBOARD_URL,
-        client_id=client_id,
-        reason=str(reason),
-        origin=DASHBOARD_ORIGIN_AI_TRANSFER,
-    )
-    if not transfer_twiml:
-        logger.error(f"No dashboard transfer URL available — cannot transfer call {call_sid}")
-        mark_transfer_state(call_sid, "failed", reason, callback_requested=True)
-        await params.result_callback({
-            "transferred": False,
-            "message": "I'm having trouble with the transfer right now. Let me take your info and have someone call you back within the hour.",
-        })
-        return
 
     try:
-        # Twilio SDK is synchronous — run in thread executor
-        client = _get_twilio_client()
-        await asyncio.to_thread(
-            client.calls(call_sid).update,
-            twiml=transfer_twiml,
+        redirect_result = await redirect_live_call_via_dashboard(
+            client_config=config,
+            client_id=client_id,
+            call_sid=call_sid,
+            reason=str(reason),
+            origin=DASHBOARD_ORIGIN_AI_TRANSFER,
+            dashboard_url=DASHBOARD_URL,
+            platform_api_key=PLATFORM_API_KEY,
         )
+        if not redirect_result.ok:
+            raise RuntimeError(
+                "dashboard live-call redirect failed "
+                f"status={redirect_result.status} error={redirect_result.error}"
+            )
 
-        logger.info(f"Call {call_sid} redirected to dashboard human handoff (reason: {reason})")
+        logger.info(
+            f"Call {call_sid} redirected to dashboard human handoff via dashboard "
+            f"endpoint for {company_name} (reason: {reason})"
+        )
 
         # Dashboard Twilio routes own the final softphone/handoff result from
         # this point forward. Do not write legacy phone-agent transfer updates

@@ -41,6 +41,7 @@ from agent.phone_coverage import (
     build_no_handoff_twiml,
     resolve_phone_coverage_decision,
 )
+from agent.dashboard_redirect import redirect_live_call_via_dashboard
 from agent.handlers import process_transfer_status_callback, sanitize_transfer_reason_token
 
 app = FastAPI(title="ScaleYourJunk Phone Agent")
@@ -48,16 +49,6 @@ app = FastAPI(title="ScaleYourJunk Phone Agent")
 # ── Concurrent call tracking ────────────────────────────
 _active_calls: dict[str, asyncio.Task] = {}
 _calls_lock = asyncio.Lock()
-_twilio_client = None
-
-
-def _get_twilio_client():
-    """Get or create Twilio REST client for live call redirects."""
-    global _twilio_client
-    if _twilio_client is None:
-        from twilio.rest import Client as TwilioClient
-        _twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    return _twilio_client
 
 
 @app.on_event("startup")
@@ -115,32 +106,36 @@ async def _redirect_live_call_to_dashboard_handoff(
     *,
     call_sid: str,
     client_id: str,
+    client_config: dict | None = None,
     company_name: str,
     reason: str,
     origin: str,
 ) -> bool:
-    """Ask Twilio to move an already-connected live call to dashboard handoff."""
+    """Ask dashboard to move an already-connected live call to human handoff."""
     if not call_sid:
         return False
 
-    twiml = build_dashboard_handoff_redirect_twiml(
-        company_name=company_name,
+    result = await redirect_live_call_via_dashboard(
+        client_config=client_config or {},
         client_id=client_id,
-        dashboard_url=DASHBOARD_URL,
+        call_sid=call_sid,
         reason=reason,
         origin=origin,
-    ) or build_no_handoff_twiml(company_name)
-
-    try:
-        client = _get_twilio_client()
-        await asyncio.to_thread(client.calls(call_sid).update, twiml=twiml)
-        return True
-    except Exception as exc:
-        logger.error(
-            f"Failed to redirect live call {call_sid} for client={client_id} "
-            f"reason={reason}: {exc}"
+        dashboard_url=DASHBOARD_URL,
+        platform_api_key=PLATFORM_API_KEY,
+    )
+    if result.ok:
+        logger.info(
+            f"Dashboard accepted live handoff redirect for call={call_sid} "
+            f"client={client_id} reason={reason} origin={origin}"
         )
-        return False
+        return True
+
+    logger.error(
+        f"Dashboard live handoff redirect failed for call={call_sid} client={client_id} "
+        f"reason={reason} origin={origin} status={result.status} error={result.error}"
+    )
+    return False
 
 
 @app.post("/twiml/{client_id}")
@@ -321,6 +316,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             redirected = await _redirect_live_call_to_dashboard_handoff(
                 call_sid=call_id,
                 client_id=client_id,
+                client_config={},
                 company_name="our team",
                 reason="phone_agent_at_capacity",
                 origin=DASHBOARD_ORIGIN_CAPACITY,

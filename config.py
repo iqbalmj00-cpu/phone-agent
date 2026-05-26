@@ -34,6 +34,10 @@ CARTESIA_SPEED = os.getenv("CARTESIA_SPEED", "normal").strip().lower()
 
 # ── Dashboard Connection ────────────────────────────────
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "")
+DASHBOARD_LIVE_CALL_REDIRECT_PATH = os.getenv(
+    "DASHBOARD_LIVE_CALL_REDIRECT_PATH",
+    "/api/agent/voice/redirect-live-call",
+)
 INGEST_API_KEY = os.getenv("INGEST_API_KEY", "")
 PLATFORM_API_KEY = os.getenv("PLATFORM_API_KEY", "")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")

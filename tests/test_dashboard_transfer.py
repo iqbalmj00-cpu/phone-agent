@@ -1,26 +1,9 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from agent import handlers
+from agent.dashboard_redirect import DashboardLiveRedirectResult
 import bot
-
-
-class FakeCall:
-    def __init__(self):
-        self.twiml_updates = []
-
-    def update(self, *, twiml):
-        self.twiml_updates.append(twiml)
-
-
-class FakeTwilioClient:
-    def __init__(self):
-        self.call_sid = ""
-        self.call = FakeCall()
-
-    def calls(self, call_sid):
-        self.call_sid = call_sid
-        return self.call
 
 
 class FakeParams:
@@ -57,19 +40,30 @@ class DashboardTransferTests(unittest.IsolatedAsyncioTestCase):
         handlers._terminal_transfer_states.clear()
 
     async def test_dashboard_transfer_does_not_create_legacy_pending_transfer(self):
-        fake_twilio = FakeTwilioClient()
         params = FakeParams({"reason": "Caller asked for dispatch"})
+        redirect_mock = AsyncMock(return_value=DashboardLiveRedirectResult(ok=True, status=200))
 
         with patch.object(handlers, "DASHBOARD_URL", "https://dashboard.example.com"), patch.object(
+            handlers, "PLATFORM_API_KEY", "platform-secret"
+        ), patch.object(
+            handlers,
+            "redirect_live_call_via_dashboard",
+            redirect_mock,
+        ), patch.object(
             handlers,
             "_get_twilio_client",
-            return_value=fake_twilio,
+            side_effect=AssertionError("AI transfer must not update Twilio directly"),
         ):
             await handlers.handle_transfer_to_human(params)
 
-        self.assertEqual(fake_twilio.call_sid, self.call_sid)
-        self.assertEqual(len(fake_twilio.call.twiml_updates), 1)
-        self.assertIn("origin=phone_agent_ai_transfer", fake_twilio.call.twiml_updates[0])
+        redirect_mock.assert_awaited_once()
+        redirect_kwargs = redirect_mock.await_args.kwargs
+        self.assertEqual(redirect_kwargs["client_id"], "client-1")
+        self.assertEqual(redirect_kwargs["call_sid"], self.call_sid)
+        self.assertEqual(redirect_kwargs["reason"], "Caller asked for dispatch")
+        self.assertEqual(redirect_kwargs["origin"], "phone_agent_ai_transfer")
+        self.assertEqual(redirect_kwargs["dashboard_url"], "https://dashboard.example.com")
+        self.assertEqual(redirect_kwargs["platform_api_key"], "platform-secret")
         self.assertEqual(handlers.get_pending_transfer_state(self.call_sid), {})
         self.assertTrue(handlers.is_dashboard_owned_transfer(self.call_sid))
         self.assertFalse(bot.should_write_final_call_log(self.call_sid))

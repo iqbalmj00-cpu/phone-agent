@@ -449,16 +449,219 @@ def get_cached_lookup_jobs(call_sid: str, phone: str) -> list[dict[str, Any]] | 
     return ctx.get("appointment_lookups", {}).get(key)
 
 
+# ── Caller identity ──────────────────────────────────────────────
+
+
+def caller_id_matches(call_sid: str, phone: str) -> bool:
+    """True when the number being asked about is the number actually calling.
+
+    Twilio supplies the calling number on the webhook and it is stored as
+    `caller_number`. A number the caller merely *says* is not evidence of
+    anything — before this check existed, stating any phone number returned that
+    customer's name, service address, appointment date and price, and then
+    allowed rescheduling or cancelling their job.
+    """
+    caller_number = _call_contexts.get(call_sid, {}).get("caller_number", "")
+    a = _phone_lookup_key(caller_number)
+    b = _phone_lookup_key(phone)
+    return bool(a) and bool(b) and a == b
+
+
+def mark_identity_verified(call_sid: str, phone: str, job_ids: list[str] | None = None):
+    """Record that this caller proved the booking is theirs, for this call only.
+
+    `job_ids` scopes what they proved. Passing None means unrestricted, which is
+    only correct when the caller ID matches the number on the booking — they
+    already hold the phone, so every booking on it is theirs.
+
+    Passing a list restricts them to exactly those jobs. Proving you know the
+    address of ONE booking must not hand you the rest of the account.
+    """
+    if call_sid not in _call_contexts:
+        return
+    key = _phone_lookup_key(phone)
+    if not key:
+        return
+    _call_contexts[call_sid].setdefault("verified_identities", set()).add(key)
+    scopes = _call_contexts[call_sid].setdefault("verified_job_scope", {})
+    if job_ids is None:
+        scopes.pop(key, None)
+    else:
+        scopes[key] = {str(j) for j in job_ids if j}
+
+
+def is_identity_verified(call_sid: str, phone: str) -> bool:
+    """True if the caller owns this number or has passed the address challenge."""
+    if caller_id_matches(call_sid, phone):
+        return True
+    key = _phone_lookup_key(phone)
+    if not key:
+        return False
+    return key in _call_contexts.get(call_sid, {}).get("verified_identities", set())
+
+
+def verified_job_scope(call_sid: str, phone: str) -> set[str] | None:
+    """Job ids this caller is limited to, or None for unrestricted access.
+
+    Unrestricted is the caller-ID-matches case. Anyone who got in by answering
+    the address challenge is pinned to the job they answered for.
+    """
+    if caller_id_matches(call_sid, phone):
+        return None
+    key = _phone_lookup_key(phone)
+    if not key:
+        return None
+    return _call_contexts.get(call_sid, {}).get("verified_job_scope", {}).get(key)
+
+
+def limit_jobs_to_scope(call_sid: str, phone: str, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop any job this caller has not proved is theirs.
+
+    Applied on every lookup, not just the first. Without it a second
+    `lookup_appointment` — which the prompt tells the model to run before any
+    reschedule or cancel — refilled the cache with the whole account, and the
+    "which booking did you mean?" reply then read out the addresses and dates of
+    bookings the caller had proved nothing about.
+    """
+    scope = verified_job_scope(call_sid, phone)
+    if scope is None:
+        return jobs
+    return [j for j in jobs if str(j.get("jobId") or j.get("id") or "") in scope]
+
+
+# Words that identify a street type rather than the street itself. Matching on
+# these would let "500 Avenue" stand in for "500 Pine Avenue".
+_ADDRESS_GENERIC_WORDS = {
+    "street", "str", "avenue", "ave", "road", "rd", "drive", "dr", "lane", "ln",
+    "boulevard", "blvd", "court", "ct", "terrace", "ter", "place", "pl",
+    "circle", "cir", "way", "parkway", "pkwy", "highway", "hwy", "route",
+    "trail", "path", "plaza", "square", "sq", "loop", "crossing", "extension",
+    "north", "south", "east", "west", "the", "apt", "apartment", "unit",
+    "suite", "ste", "floor", "building", "bldg",
+}
+
+
+def _address_tokens(address: str) -> tuple[str, set[str]]:
+    """Split an address into its house number and the words that name the street.
+
+    Only the segment before the first comma is considered. The rest is city,
+    state and ZIP — constants for a single-metro operator, and public. Including
+    them meant "12 Houston" passed the challenge for "12 Oak St, Houston, TX",
+    reducing the secret to the house number alone.
+    """
+    street_line = (address or "").split(",")[0]
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", street_line.lower())
+    parts = cleaned.split()
+    house = next((p for p in parts if p.isdigit()), "")
+    words = {
+        p for p in parts
+        if len(p) >= 3 and not p.isdigit() and p not in _ADDRESS_GENERIC_WORDS
+    }
+    return house, words
+
+
+def address_matches(stated: str, on_file: str) -> bool:
+    """Forgiving comparison between a spoken address and the stored one.
+
+    A caller says "twelve Oak Street"; the record holds
+    "12 Oak St, Houston, TX 77008". Requiring an exact match would reject real
+    customers, so this requires the house number to match exactly and at least
+    one distinctive street word to appear in both. Deliberately lenient on
+    everything else — this checks that the caller knows where the job is, it is
+    not an address parser.
+
+    Fails closed: if either side yields no distinctive word, there is nothing to
+    prove knowledge of and the answer is no.
+    """
+    stated_house, stated_words = _address_tokens(stated)
+    file_house, file_words = _address_tokens(on_file)
+    if not stated_house or not file_house or stated_house != file_house:
+        return False
+    return bool(stated_words & file_words)
+
+
+def record_failed_identity_challenge(call_sid: str, phone: str):
+    """Lock this number out of the address challenge for the rest of the call."""
+    if call_sid not in _call_contexts:
+        return
+    key = _phone_lookup_key(phone)
+    if key:
+        _call_contexts[call_sid].setdefault("identity_challenge_failed", set()).add(key)
+
+
+def identity_challenge_locked(call_sid: str, phone: str) -> bool:
+    """True once this number's challenge has been failed on this call."""
+    key = _phone_lookup_key(phone)
+    if not key:
+        return False
+    return key in _call_contexts.get(call_sid, {}).get("identity_challenge_failed", set())
+
+
+# Held server-side between the lookup and the challenge. Deliberately NOT
+# returned to the model: it cannot disclose what it was never given.
+def stash_pending_verification(call_sid: str, phone: str, payload: dict[str, Any]):
+    """Arm one address challenge.
+
+    Refuses to re-arm after a failure. Dropping the stash on a failed guess is
+    not enough on its own: `lookup_appointment` can simply be called again, and
+    the prompt actively encourages that, so each new lookup handed the caller a
+    fresh guess. Unlimited guesses against a house number and street name is not
+    a challenge.
+    """
+    if call_sid not in _call_contexts:
+        return
+    if identity_challenge_locked(call_sid, phone):
+        return
+    _call_contexts[call_sid]["pending_verification"] = {"phone": phone, **payload}
+
+
+def get_pending_verification(call_sid: str) -> dict[str, Any] | None:
+    return _call_contexts.get(call_sid, {}).get("pending_verification")
+
+
 def resolve_job_id_from_lookup(
     call_sid: str,
     phone: str,
     provided_job_id: str | None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Require lookup-backed job selection before mutating existing bookings."""
+    cached_jobs = get_cached_lookup_jobs(call_sid, phone)
+    # Belt and braces: the cache is already scoped at lookup time, but this is
+    # the only door to reschedule and cancel, so re-apply it here too.
+    if cached_jobs is not None:
+        cached_jobs = limit_jobs_to_scope(call_sid, phone, cached_jobs)
+
+    # Identity first. Without this, a caller who learned someone else's job id
+    # could reschedule or cancel it — the dashboard ignores `phone` entirely once
+    # a job id is supplied, so this is the only place it can be stopped.
+    if not is_identity_verified(call_sid, phone):
+        return None, {
+            "error": "identity_not_verified",
+            "fallback": True,
+            "message": (
+                "This caller has not confirmed the booking is theirs. Do not "
+                "change or cancel it. Transfer them to a human."
+            ),
+        }
+
     if provided_job_id:
+        # Only accept a job id that came from this call's own lookup. Previously
+        # any job id was taken on trust.
+        known = {
+            str(job.get("jobId") or job.get("id") or "")
+            for job in (cached_jobs or [])
+        }
+        if str(provided_job_id) not in known:
+            return None, {
+                "error": "job_id_not_from_lookup",
+                "message": (
+                    "That appointment was not one of the ones found for this "
+                    "caller. Look up their appointments again and confirm which "
+                    "one they mean."
+                ),
+            }
         return provided_job_id, None
 
-    cached_jobs = get_cached_lookup_jobs(call_sid, phone)
     if cached_jobs is None:
         return None, {
             "error": "lookup_required",
@@ -501,6 +704,7 @@ def remember_address_verification(
     spoken_address: str,
     service_area_status: str,
     reason: str,
+    unit: str = "",
 ):
     """Cache address verification so create_booking can block clear out-of-area jobs."""
     if call_sid not in _call_contexts:
@@ -512,6 +716,9 @@ def remember_address_verification(
         "spoken_address": spoken_address,
         "service_area_status": service_area_status,
         "reason": reason,
+        # Apartment/suite, from Google's subpremise or parsed out of what the
+        # caller actually said. The geocoder's formatted_address drops it.
+        "unit": unit,
     }
     for key_source in (raw_address, formatted_address):
         key = _normalize_address_key(key_source)
@@ -538,11 +745,99 @@ def get_address_verification(call_sid: str, address: str) -> dict[str, Any] | No
     return None
 
 
+_UNIT_PREFIXES = (
+    "apt", "apartment", "unit", "ste", "suite", "#",
+    "fl", "floor", "rm", "room", "bldg", "building", "lot", "trlr",
+)
+
+# The prefixes safe to EXTRACT from a full address. Deliberately not the same
+# tuple as above: "fl" is the Florida abbreviation, so "Miami, FL 33101" was
+# being read as floor 33101 and folded back into the street line. "floor" still
+# works. A caller who says "fl" loses the unit, which is the safe direction —
+# a missing unit is a phone call, a corrupted street line is a wasted truck.
+_UNIT_PREFIX_WORDS = "apt|apartment|unit|ste|suite|floor|rm|room|bldg|building|lot|trlr"
+
+# Matches "apartment 4B", "apt 4b", "unit 12", "suite 200", "#3".
+#
+# Two subtleties, both of which cost a real unit number when got wrong:
+#   - The captured value must contain a digit or be a single letter, so a street
+#     named "Building Road" isn't read as unit "Road".
+#   - A separator after a word prefix is REQUIRED. Without it "88 Unity Ave Apt 3"
+#     matches "unit" + "y" first, and because re.search takes the leftmost match
+#     the genuine "Apt 3" is never seen.
+_UNIT_RE = re.compile(
+    rf"(?:\b(?:{_UNIT_PREFIX_WORDS})[.\s#]+|#\s*)"
+    r"((?=[a-z0-9\-]*\d)[a-z0-9\-]{1,8}|[a-z])\b",
+    re.IGNORECASE,
+)
+
+
+def extract_address_unit(address: str) -> str:
+    """Pull an apartment / suite / unit out of an address as the caller said it.
+
+    Google's geocoder returns a `formatted_address` that almost never carries a
+    unit number, and `resolve_booking_address` substitutes it for the caller's
+    own words — so before this existed an apartment caller silently lost their
+    unit and the crew was dispatched to the building with no way to find them.
+    """
+    match = _UNIT_RE.search(address or "")
+    if not match:
+        return ""
+    return match.group(0).strip()
+
+
+def _bare_unit_value(unit: str) -> str:
+    """The unit with any prefix word or leading punctuation stripped: "Apt 4" → "4"."""
+    stripped = re.sub(rf"^\s*(?:{_UNIT_PREFIX_WORDS})\b\.?\s*", "", unit.strip(), flags=re.IGNORECASE)
+    return stripped.lstrip("#").strip()
+
+
+def _street_already_has_unit(street: str, unit: str) -> bool:
+    """Is this unit already in the street line, however it happens to be written?
+
+    A literal substring test is not enough. Google renders a subpremise as "#4",
+    so composing unit "4" produced the suffix "Unit 4", failed to find it in
+    "123 Main St #4", and appended a second copy — the caller then heard
+    "123 Main St #4 Unit 4" read back.
+    """
+    value = _bare_unit_value(unit)
+    if not value:
+        return False
+    pattern = rf"(?:#|\b(?:{_UNIT_PREFIX_WORDS})\b\.?)\s*{re.escape(value)}\b"
+    return re.search(pattern, street, re.IGNORECASE) is not None
+
+
+def compose_address(address: str, unit: str | None) -> str:
+    """Fold a unit back into a street address, before the first comma.
+
+    Mirrors `composeAddress` in website-template/lib/wizardData.ts and
+    booking-widget/src/lib/wizardData.ts. Keep the three in step.
+    """
+    street = (address or "").strip()
+    clean = (unit or "").strip()
+    if not clean:
+        return street
+
+    if _street_already_has_unit(street, clean):
+        return street
+
+    has_prefix = any(clean.lower().startswith(p) for p in _UNIT_PREFIXES)
+    suffix = clean if has_prefix else f"Unit {clean}"
+
+    comma = street.find(",")
+    if comma == -1:
+        return f"{street} {suffix}".strip()
+    return f"{street[:comma]} {suffix}{street[comma:]}"
+
+
 def resolve_booking_address(call_sid: str, address: str) -> tuple[str, dict[str, Any] | None]:
     """Return the canonical verified address for booking when available."""
     verification = get_address_verification(call_sid, address) if call_sid else None
     if verification and verification.get("formatted_address"):
-        return str(verification["formatted_address"]), verification
+        # Re-attach the unit. The geocoder drops it, and the address stored on
+        # the job is what the driver app and the confirmation SMS both show.
+        unit = str(verification.get("unit") or "") or extract_address_unit(address)
+        return compose_address(str(verification["formatted_address"]), unit), verification
     return address, verification
 
 
@@ -565,6 +860,9 @@ def _extract_geocode_components(result: dict[str, Any]) -> dict[str, str]:
     state_long, state_short = _component_long_short(result, "administrative_area_level_1")
     county = _component_long_short(result, "administrative_area_level_2")[0]
     postal_code = _component_long_short(result, "postal_code")[0]
+    # Google returns the apartment/suite as `subpremise` when it has one. It
+    # usually doesn't, which is why the caller's own words are the fallback.
+    subpremise = _component_long_short(result, "subpremise")[0]
     return {
         "street_number": street_number,
         "route": route,
@@ -573,6 +871,7 @@ def _extract_geocode_components(result: dict[str, Any]) -> dict[str, str]:
         "state_long": state_long,
         "county": county,
         "postal_code": postal_code,
+        "subpremise": subpremise,
     }
 
 
@@ -1105,6 +1404,31 @@ def _validate_time_slot(slot_id: str) -> dict | None:
     return None
 
 
+def _slot_wire_value(slot: dict[str, Any]) -> str:
+    """The value to put in `timeSlot` when talking to the dashboard.
+
+    Always an explicit "HH:MM-HH:MM" range, never a label.
+
+    The agent's vocabulary and the dashboard's do not match: the dashboard has
+    MORNING / MIDDAY / EVENING and no "afternoon" at all, so it mapped our
+    "Afternoon" onto MIDDAY. A caller told "1 PM to 4 PM" ended up with a job
+    recorded as 11:00 AM – 2:00 PM — which is what the customer portal, the
+    driver app, the reminder email and this agent's own later lookup all read.
+    Sending the range removes the translation step entirely.
+
+    "All Day" is the dumpster-delivery sentinel, not a time window. It must stay
+    a label: expanded to 08:00-17:00 it would be read back as a MIDDAY slot.
+    """
+    period = str(slot.get("period") or "")
+    if period.lower() == "all day":
+        return "All Day"
+    start = str(slot.get("start") or "")
+    end = str(slot.get("end") or "")
+    if start and end:
+        return f"{start}-{end}"
+    return period
+
+
 def _is_business_hours(date: datetime, slot_or_hour: Any, config: dict) -> bool:
     """Check if date/time falls within this client's business hours."""
     # Convert Python weekday (0=Mon) to JS convention (0=Sun) used by dashboard
@@ -1489,7 +1813,7 @@ async def handle_create_booking(params: FunctionCallParams):
         slot = _validate_time_slot(time_slot_id)
         if not slot:
             await params.result_callback({
-                "error": "I need a valid time. Check available slots first with check_available_slots, or use: morning, midday, or afternoon."
+                "error": "I need a valid time as a 24-hour range like 08:00-11:00. Call check_available_slots first and pass back one of the ranges it returns."
             })
             return
 
@@ -1539,7 +1863,7 @@ async def handle_create_booking(params: FunctionCallParams):
         "customerPhone": phone,
         "address": address,
         "date": local_datetime,
-        "timeSlot": slot["period"],  # "08:00-10:00" or "Morning"
+        "timeSlot": _slot_wire_value(slot),  # "13:00-16:00", or "All Day" for dumpsters
         "notes": notes,
         "type": booking_type,
         "serviceType": service_type,
@@ -1706,11 +2030,13 @@ async def handle_lookup_appointment(params: FunctionCallParams):
     config = _get_config()
     ctx = _get_context()
     raw_phone = params.arguments.get("phone", "")
-    import re
+    # A spoken number is fine as a *search key* — it is not evidence of identity.
+    # Whether the details may be disclosed is decided after the lookup, below.
     if re.search(r"\d{7,}", re.sub(r"[\s\-\(\)\+]", "", raw_phone)):
         phone = raw_phone
     else:
         phone = ctx.get("caller_number", raw_phone)
+    call_sid = ctx.get("call_sid", "")
 
     try:
         async with aiohttp.ClientSession() as http:
@@ -1726,14 +2052,67 @@ async def handle_lookup_appointment(params: FunctionCallParams):
                 data = await _safe_json(resp, "lookup-appointment")
                 if data.get("found"):
                     jobs = data.get("jobs", [])
-                    remember_lookup_results(ctx.get("call_sid", ""), phone, jobs)
+                    customer = data.get("customer", {})
+                    # A caller who passed the address challenge earlier in this
+                    # call is pinned to the job they proved. Re-running the
+                    # lookup must not hand back the rest of the account.
+                    jobs = limit_jobs_to_scope(call_sid, phone, jobs)
+                    remember_lookup_results(call_sid, phone, jobs)
+
+                    if is_identity_verified(call_sid, phone):
+                        if caller_id_matches(call_sid, phone):
+                            # Calling from the number on the booking — nothing
+                            # to prove, and every job on it is theirs.
+                            mark_identity_verified(call_sid, phone)
+                        # Otherwise they already passed the challenge earlier in
+                        # this call. Do not re-challenge, and do not re-mark:
+                        # marking again here would widen their scope back to the
+                        # whole account. `jobs` is already limited to it.
+                        await params.result_callback({
+                            "found": True,
+                            "customer": customer,
+                            "jobs": jobs,
+                        })
+                        return
+
+                    # Already failed the challenge on this call. Do not offer
+                    # another one, and still disclose nothing.
+                    if identity_challenge_locked(call_sid, phone):
+                        await params.result_callback({
+                            "found": True,
+                            "verification_required": True,
+                            "fallback": True,
+                            "error": "identity_verification_failed",
+                            "message": (
+                                "This caller already failed to confirm this booking on "
+                                "this call. Do not ask again, do not reveal any detail "
+                                "of it, and do not offer a callback. Tell them you'll "
+                                "put them through to someone who can help, and call "
+                                "transfer_to_human now."
+                            ),
+                        })
+                        return
+
+                    # Different number. Hold everything server-side and make the
+                    # caller produce the service address first. The details are
+                    # deliberately NOT returned here — the model cannot read out
+                    # what it was never given.
+                    stash_pending_verification(call_sid, phone, {"customer": customer, "jobs": jobs})
                     await params.result_callback({
                         "found": True,
-                        "customer": data.get("customer", {}),
-                        "jobs": jobs,
+                        "verification_required": True,
+                        "message": (
+                            "A booking exists, but this caller is not ringing from the "
+                            "number on it, so I cannot show you any of its details yet. "
+                            "Do not guess or imply anything about it. Ask the caller for "
+                            "the service address for the job, then call "
+                            "verify_caller_identity with what they say. If they already "
+                            "told you the address, confirm the phone number on the "
+                            "account with them and still pass the address through."
+                        ),
                     })
                 else:
-                    remember_lookup_results(ctx.get("call_sid", ""), phone, [])
+                    remember_lookup_results(call_sid, phone, [])
                     await params.result_callback({
                         "found": False,
                         "message": "No appointments found for that number."
@@ -1751,6 +2130,81 @@ async def handle_lookup_appointment(params: FunctionCallParams):
             "lookup_appointment",
             "I'm having trouble looking that up right now.",
         ))
+
+
+async def handle_verify_caller_identity(params: FunctionCallParams):
+    """Release a booking's details once the caller proves the job is theirs.
+
+    Only reached when someone rings about a booking from a number other than the
+    one on it. The caller must state the service address; it is compared against
+    the record held server-side by `handle_lookup_appointment`.
+
+    On failure the caller is handed to a human — deliberately not offered a
+    callback, because a callback would still be an unverified caller directing
+    where the business rings back to.
+    """
+    ctx = _get_context()
+    call_sid = ctx.get("call_sid", "")
+    stated_address = str(params.arguments.get("address") or "").strip()
+
+    pending = get_pending_verification(call_sid)
+    if not pending:
+        await params.result_callback({
+            "verified": False,
+            "error": "no_pending_verification",
+            "message": "Look up the caller's appointment first.",
+        })
+        return
+
+    if not stated_address:
+        await params.result_callback({
+            "verified": False,
+            "message": "Ask the caller for the service address for the job, then try again.",
+        })
+        return
+
+    jobs = pending.get("jobs", [])
+    matched = [job for job in jobs if address_matches(stated_address, str(job.get("address") or ""))]
+
+    if not matched:
+        # Drop the stashed payload AND lock the number out, so a fresh
+        # lookup_appointment cannot re-arm the challenge for another guess.
+        # The model is not a security control; the prompt asking it not to retry
+        # was the only thing standing between a caller and unlimited guesses.
+        _call_contexts.get(call_sid, {}).pop("pending_verification", None)
+        record_failed_identity_challenge(call_sid, str(pending.get("phone") or ""))
+        # Do not say what was expected, do not offer another guess, do not hint
+        # at how close they were. Hand off.
+        await params.result_callback({
+            "verified": False,
+            "fallback": True,
+            "error": "identity_verification_failed",
+            "message": (
+                "That does not match the address on the booking. Do not reveal any "
+                "detail of it, do not offer another attempt, and do not offer a "
+                "callback. Tell the caller you'll put them through to someone who "
+                "can help, and call transfer_to_human now."
+            ),
+        })
+        return
+
+    phone = str(pending.get("phone") or "")
+    # Pin them to the job they proved. The scope is what makes the narrowing
+    # below durable — a second lookup re-applies it instead of undoing it.
+    mark_identity_verified(
+        call_sid,
+        phone,
+        job_ids=[str(j.get("jobId") or j.get("id") or "") for j in matched],
+    )
+    remember_lookup_results(call_sid, phone, matched)
+    _call_contexts.get(call_sid, {}).pop("pending_verification", None)
+
+    await params.result_callback({
+        "verified": True,
+        "customer": pending.get("customer", {}),
+        "jobs": matched,
+        "message": "Address confirmed. You can now discuss and change this booking.",
+    })
 
 
 async def handle_reschedule_appointment(params: FunctionCallParams):
@@ -1780,7 +2234,7 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
     slot = _validate_time_slot(new_time_slot_id)
     if not slot:
         await params.result_callback({
-            "error": "Please use a valid time window: morning, midday, or afternoon."
+            "error": "Please use a 24-hour range like 08:00-11:00. Call check_available_slots first and pass back one of the ranges it returns."
         })
         return
 
@@ -1806,7 +2260,7 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
                     "phone": phone,
                     "newDate": new_date,
                     "newTime": slot["start"],
-                    "timeSlot": slot["period"],
+                    "timeSlot": _slot_wire_value(slot),
                 }
             payload["jobId"] = job_id
             resp = await http.post(
@@ -1976,6 +2430,13 @@ async def handle_verify_address(params: FunctionCallParams):
                     })
                     return
 
+                # Prefer Google's subpremise; fall back to whatever unit the
+                # caller actually said, since the geocoder rarely returns one.
+                unit = components.get("subpremise") or extract_address_unit(address)
+                # Read the unit back too — otherwise the agent confirms an
+                # address the caller will not recognise as their own.
+                formatted = compose_address(formatted, unit)
+
                 spoken_address = format_address_for_speech(formatted)
                 area_status, area_reason = _assess_service_area(components, config)
                 if call_sid:
@@ -1986,6 +2447,7 @@ async def handle_verify_address(params: FunctionCallParams):
                         spoken_address,
                         area_status,
                         area_reason,
+                        unit=unit,
                     )
 
                 if area_status == "out_of_area":

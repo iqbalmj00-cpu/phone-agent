@@ -75,6 +75,7 @@ from agent.handlers import (
     handle_check_container_availability,
     handle_check_available_slots,
     handle_lookup_appointment,
+    handle_verify_caller_identity,
     handle_reschedule_appointment,
     handle_cancel_appointment,
     handle_schedule_callback,
@@ -322,6 +323,225 @@ async def _summarize_call_with_anthropic(transcript_messages: list[dict]) -> str
     return _extract_anthropic_text(response) or "Summary unavailable"
 
 
+# ── Post-Call Finalization ──────────────────────────────
+
+
+class _OnceGuard:
+    """Claim-once flag guarding work that has two possible entry points.
+
+    `claim()` is synchronous and flips the flag before returning, so two
+    coroutines racing into the same guarded block cannot both win — asyncio
+    only switches tasks at an await, and there isn't one here.
+    """
+
+    def __init__(self) -> None:
+        self._claimed = False
+
+    def claim(self) -> bool:
+        if self._claimed:
+            return False
+        self._claimed = True
+        return True
+
+
+async def run_post_call(
+    *,
+    call_id: str,
+    caller_number: str,
+    client_config: dict,
+    context: LLMContext,
+    call_start_time: datetime,
+    timezone: str,
+) -> None:
+    """Summarize the call, log it to the dashboard, and release per-call state.
+
+    Module-level rather than nested inside `run_bot` for two reasons: it closes
+    over nothing, and a nested version could only be reached through a live
+    websocket transport, which put it beyond the reach of any test.
+
+    Runs exactly once per call — see `_OnceGuard` at the call site.
+    """
+    # Wait for any in-flight tool tasks (e.g. create_booking API request
+    # in mid-flight) before snapshotting state. Prevents "ghost bookings"
+    # where the dashboard creates the booking but the call log records
+    # outcome="info_only" because mark_booking_complete didn't fire in time.
+    inflight = get_inflight_tasks(call_id)
+    if inflight:
+        logger.info(f"Waiting up to {INFLIGHT_TASK_WAIT_SECONDS}s for {len(inflight)} in-flight tool task(s) before snapshotting {call_id}")
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*inflight, return_exceptions=True),
+                timeout=INFLIGHT_TASK_WAIT_SECONDS
+            )
+            logger.info(f"In-flight tasks completed for {call_id}")
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for in-flight tasks on {call_id} — snapshotting anyway")
+
+    # Keep per-call context until after summary/logging so a Twilio
+    # transfer-status callback can still update the state if it arrives fast.
+    saved_caller = caller_number
+    saved_config = dict(client_config)  # shallow copy
+    saved_twilio_number = client_config.get("twilioNumber", "")
+
+    # Generate post-call summary
+    call_end_time = datetime.now(ZoneInfo(timezone))
+    duration_s = int((call_end_time - call_start_time).total_seconds())
+
+    transcript_messages = [
+        m for m in context.messages
+        if m.get("role") in ("user", "assistant") and str(m.get("content", "")).strip()
+    ]
+
+    try:
+        if not transcript_messages:
+            summary = "No caller conversation captured. Caller disconnected before a real exchange was recorded."
+        else:
+            summary = await asyncio.wait_for(
+                _summarize_call_with_anthropic(transcript_messages),
+                timeout=SUMMARY_WAIT_SECONDS,
+            )
+    except asyncio.TimeoutError:
+        logger.error(f"Summary generation timed out after {SUMMARY_WAIT_SECONDS}s")
+        try:
+            transcript_parts = []
+            for m in transcript_messages[-10:]:
+                role = m.get("role", "")
+                content = _message_content_to_text(m.get("content"))[:80]
+                if content:
+                    label = "Caller" if role == "user" else "Agent"
+                    transcript_parts.append(f"{label}: {content}")
+            transcript = " | ".join(transcript_parts)[:500]
+            summary = (
+                f"AI summary unavailable. Recent transcript: {transcript}"
+                if transcript
+                else "Summary unavailable"
+            )
+        except Exception as fallback_err:
+            logger.error(f"Transcript fallback also failed: {fallback_err}")
+            summary = "Summary unavailable"
+    except Exception as e:
+        logger.error(f"Summary generation failed: {e}")
+        # Fallback: build a minimal transcript from the last 10 real turns so
+        # the operator has SOME context instead of "Summary unavailable".
+        try:
+            transcript_parts = []
+            for m in transcript_messages[-10:]:
+                role = m.get("role", "")
+                content = _message_content_to_text(m.get("content"))[:80]
+                if content:
+                    label = "Caller" if role == "user" else "Agent"
+                    transcript_parts.append(f"{label}: {content}")
+            transcript = " | ".join(transcript_parts)[:500]
+            summary = (
+                f"AI summary unavailable. Recent transcript: {transcript}"
+                if transcript
+                else "Summary unavailable"
+            )
+        except Exception as fallback_err:
+            logger.error(f"Transcript fallback also failed: {fallback_err}")
+            summary = "Summary unavailable"
+
+    logger.info(f"Call summary [{call_id}] ({duration_s}s): {summary}")
+
+    # Capture state after summary generation, immediately before logging.
+    booked = is_booking_complete(call_id)
+    transferred = was_transfer_complete(call_id)
+    transfer_state = get_transfer_state(call_id)
+    booking_log_state = get_booking_log_state(call_id)
+    sms_consented = has_sms_consent(call_id)
+    dashboard_owned_transfer = not should_write_final_call_log(call_id)
+    transfer_status = transfer_state.get("transfer_status")
+    callback_requested = bool(transfer_state.get("callback_requested"))
+    pending_transfer = get_pending_transfer_state(call_id)
+    if pending_transfer.get("terminal_logged"):
+        transfer_status = pending_transfer.get("transfer_status") or transfer_status
+        callback_requested = bool(pending_transfer.get("callback_requested"))
+        if pending_transfer.get("summary"):
+            summary = pending_transfer["summary"]
+
+    # Determine call outcome
+    if booked:
+        outcome = "booked"
+    elif callback_requested or transfer_status in ("failed", "unavailable_no_forwarding_phone"):
+        outcome = "callback_requested"
+    elif transferred or transfer_status in ("requested", "dialing", "completed"):
+        outcome = "transferred"
+    elif duration_s < 10:
+        outcome = "voicemail"
+    else:
+        outcome = "info_only"
+
+    caller_name = str(booking_log_state.get("caller_name") or "")
+    appointment_date = str(booking_log_state.get("appointment_date") or "")
+
+    if not dashboard_owned_transfer:
+        update_pending_transfer_snapshot(
+            call_id,
+            duration=duration_s,
+            summary=summary or "",
+            from_number=saved_caller or "",
+            to_number=saved_twilio_number,
+            config=saved_config,
+            sms_consent=sms_consented,
+            callback_requested=callback_requested,
+            callback_due_at=transfer_state.get("callback_due_at"),
+            caller_name=caller_name,
+            appointment_date=appointment_date,
+        )
+
+    latest_pending_transfer = get_pending_transfer_state(call_id)
+    if latest_pending_transfer.get("terminal_logged"):
+        transfer_status = latest_pending_transfer.get("transfer_status") or transfer_status
+        callback_requested = bool(latest_pending_transfer.get("callback_requested"))
+        if latest_pending_transfer.get("summary"):
+            summary = latest_pending_transfer["summary"]
+        outcome = "callback_requested" if callback_requested or transfer_status == "failed" else "transferred"
+
+    # Dashboard-routed transfers are finalized by dashboard Twilio callbacks.
+    # A normal phone-agent call-log update here can arrive late and downgrade
+    # dashboard_answered/handoff_answered back to requested/dialing.
+    if dashboard_owned_transfer:
+        logger.info(f"Skipping phone-agent final call log for dashboard-owned transfer {call_id}")
+        clear_pending_transfer(call_id)
+    else:
+        # Log call to dashboard and wait briefly so the process cannot exit before
+        # the POST is sent. Dashboard returns 201 on create and 200 on duplicate update.
+        try:
+            await asyncio.wait_for(
+                log_call_to_dashboard(
+                    config=saved_config,
+                    twilio_call_sid=call_id,
+                    from_number=saved_caller or "",
+                    to_number=saved_twilio_number,
+                    duration=duration_s,
+                    outcome=outcome,
+                    summary=summary or "",
+                    caller_name=caller_name,
+                    appointment_date=appointment_date,
+                    sms_consent=sms_consented,
+                    transfer_reason=transfer_state.get("transfer_reason"),
+                    transfer_status=transfer_status,
+                    callback_requested=callback_requested,
+                    callback_due_at=transfer_state.get("callback_due_at"),
+                ),
+                timeout=CALL_LOG_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Timed out logging call {call_id} to dashboard")
+
+    clear_pending_transfer_if_terminal(call_id)
+
+    # Clean up per-call context after all state-dependent work is done. This also
+    # drops the retained PipelineTask, which holds a per-call VAD session.
+    clear_call_context(call_id)
+
+    # Schedule automated follow-up SMS only if consent was explicitly given
+    if not booked and not dashboard_owned_transfer and saved_caller and sms_consented is True:
+        asyncio.create_task(
+            _delayed_followup_sms(saved_caller, saved_config, delay_seconds=300)
+        )
+
+
 # ── Tool Definitions ────────────────────────────────────
 
 def _create_booking_schema(dumpster_enabled: bool) -> FunctionSchema:
@@ -335,7 +555,7 @@ def _create_booking_schema(dumpster_enabled: bool) -> FunctionSchema:
         },
         "time": {
             "type": "string",
-            "description": "Time slot: use the start-end format from check_available_slots, such as 08:00-11:00, or labels: morning, midday, afternoon.",
+            "description": "Time slot as an explicit 24-hour range, such as 08:00-11:00. Use a range returned by check_available_slots. Do not send a label like morning or afternoon — the dashboard has no 'afternoon' and silently records it as a midday window, so the caller is promised one arrival time and booked for another.",
         },
         "description": {"type": "string", "description": "Items for removal"},
         "type": {
@@ -421,11 +641,32 @@ def build_tools(dumpster_enabled: bool) -> ToolsSchema:
         _create_booking_schema(dumpster_enabled),
         FunctionSchema(
             name="lookup_appointment",
-            description="Find existing appointment by phone number",
+            description=(
+                "Find an existing appointment by phone number. If the caller is not "
+                "ringing from the number on the booking, this returns no details and "
+                "asks you to verify them first — that is expected, not an error."
+            ),
             properties={
                 "phone": {"type": "string", "description": "Phone number to search"},
             },
             required=["phone"],
+        ),
+        FunctionSchema(
+            name="verify_caller_identity",
+            description=(
+                "Confirm a caller owns a booking when they are calling from a different "
+                "number. Ask them for the service address, then pass exactly what they "
+                "said. Only call this after lookup_appointment asked you to. Never tell "
+                "the caller the address or any other booking detail first — they must "
+                "produce it themselves."
+            ),
+            properties={
+                "address": {
+                    "type": "string",
+                    "description": "The service address exactly as the caller stated it",
+                },
+            },
+            required=["address"],
         ),
         FunctionSchema(
             name="reschedule_appointment",
@@ -436,7 +677,7 @@ def build_tools(dumpster_enabled: bool) -> ToolsSchema:
                     "type": "string",
                     "description": "Internal YYYY-MM-DD date value resolved from caller's natural wording. Never ask the caller to say this format.",
                 },
-                "new_time": {"type": "string", "description": "Time slot: use start-end format from check_available_slots, such as 08:00-11:00, or labels: morning, midday, afternoon"},
+                "new_time": {"type": "string", "description": "Time slot as an explicit 24-hour range, such as 08:00-11:00. Use a range returned by check_available_slots. Do not send a label like morning or afternoon — the dashboard has no 'afternoon' and silently records it as a midday window."},
                 "job_id": {"type": "string", "description": "Job ID from lookup_appointment to target a specific booking (required when customer has multiple bookings)"},
             },
             required=["phone", "new_date", "new_time"],
@@ -649,6 +890,7 @@ async def run_bot(
             "check_container_availability", handle_check_container_availability
         )
     llm.register_function("lookup_appointment", handle_lookup_appointment)
+    llm.register_function("verify_caller_identity", handle_verify_caller_identity)
     llm.register_function(
         "reschedule_appointment", handle_reschedule_appointment, cancel_on_interruption=False
     )
@@ -718,9 +960,24 @@ async def run_bot(
         _booking_watcher_task = asyncio.create_task(_post_booking_watcher(task, context, call_id))
         _pre_silence_watcher_task = asyncio.create_task(_pre_booking_silence_watcher(task, context, call_id))
 
-    @transport.event_handler("on_client_disconnected")
-    async def on_disconnected(transport, client):
-        logger.info(f"Call disconnected: {call_id}")
+    _finalize_guard = _OnceGuard()
+
+    async def _finalize_call(reason: str):
+        """Summarize, log and release the call, from whichever end fires first.
+
+        Two paths lead here. A caller hangup arrives through
+        `on_client_disconnected`. But when the agent ends the call itself —
+        duration cap, either silence watcher, or a transfer — it does so via
+        `task.cancel()`, and the CancelledError that follows is a BaseException,
+        so it slips past the `except Exception` inside Pipecat's websocket
+        transport and the disconnect event never fires. Those calls previously
+        skipped this work entirely: no summary, no call log, and the per-call
+        context (which holds the PipelineTask) was never released.
+        """
+        if not _finalize_guard.claim():
+            return
+
+        logger.info(f"Finalizing call {call_id} ({reason})")
 
         # Cancel background watcher tasks
         if _timeout_task and not _timeout_task.done():
@@ -730,185 +987,19 @@ async def run_bot(
         if _pre_silence_watcher_task and not _pre_silence_watcher_task.done():
             _pre_silence_watcher_task.cancel()
 
-        # Wait for any in-flight tool tasks (e.g. create_booking API request
-        # in mid-flight) before snapshotting state. Prevents "ghost bookings"
-        # where the dashboard creates the booking but the call log records
-        # outcome="info_only" because mark_booking_complete didn't fire in time.
-        inflight = get_inflight_tasks(call_id)
-        if inflight:
-            logger.info(f"Waiting up to {INFLIGHT_TASK_WAIT_SECONDS}s for {len(inflight)} in-flight tool task(s) before snapshotting {call_id}")
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*inflight, return_exceptions=True),
-                    timeout=INFLIGHT_TASK_WAIT_SECONDS
-                )
-                logger.info(f"In-flight tasks completed for {call_id}")
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout waiting for in-flight tasks on {call_id} — snapshotting anyway")
+        await run_post_call(
+            call_id=call_id,
+            caller_number=caller_number,
+            client_config=client_config,
+            context=context,
+            call_start_time=call_start_time,
+            timezone=timezone,
+        )
 
-        # Keep per-call context until after summary/logging so a Twilio
-        # transfer-status callback can still update the state if it arrives fast.
-        saved_caller = caller_number
-        saved_config = dict(client_config)  # shallow copy
-        saved_twilio_number = client_config.get("twilioNumber", "")
-
-        # Generate post-call summary
-        call_end_time = datetime.now(ZoneInfo(timezone))
-        duration_s = int((call_end_time - call_start_time).total_seconds())
-
-        transcript_messages = [
-            m for m in context.messages
-            if m.get("role") in ("user", "assistant") and str(m.get("content", "")).strip()
-        ]
-
-        try:
-            if not transcript_messages:
-                summary = "No caller conversation captured. Caller disconnected before a real exchange was recorded."
-            else:
-                summary = await asyncio.wait_for(
-                    _summarize_call_with_anthropic(transcript_messages),
-                    timeout=SUMMARY_WAIT_SECONDS,
-                )
-        except asyncio.TimeoutError:
-            logger.error(f"Summary generation timed out after {SUMMARY_WAIT_SECONDS}s")
-            try:
-                transcript_parts = []
-                for m in transcript_messages[-10:]:
-                    role = m.get("role", "")
-                    content = _message_content_to_text(m.get("content"))[:80]
-                    if content:
-                        label = "Caller" if role == "user" else "Agent"
-                        transcript_parts.append(f"{label}: {content}")
-                transcript = " | ".join(transcript_parts)[:500]
-                summary = (
-                    f"AI summary unavailable. Recent transcript: {transcript}"
-                    if transcript
-                    else "Summary unavailable"
-                )
-            except Exception as fallback_err:
-                logger.error(f"Transcript fallback also failed: {fallback_err}")
-                summary = "Summary unavailable"
-        except Exception as e:
-            logger.error(f"Summary generation failed: {e}")
-            # Fallback: build a minimal transcript from the last 10 real turns so
-            # the operator has SOME context instead of "Summary unavailable".
-            try:
-                transcript_parts = []
-                for m in transcript_messages[-10:]:
-                    role = m.get("role", "")
-                    content = _message_content_to_text(m.get("content"))[:80]
-                    if content:
-                        label = "Caller" if role == "user" else "Agent"
-                        transcript_parts.append(f"{label}: {content}")
-                transcript = " | ".join(transcript_parts)[:500]
-                summary = (
-                    f"AI summary unavailable. Recent transcript: {transcript}"
-                    if transcript
-                    else "Summary unavailable"
-                )
-            except Exception as fallback_err:
-                logger.error(f"Transcript fallback also failed: {fallback_err}")
-                summary = "Summary unavailable"
-
-        logger.info(f"Call summary [{call_id}] ({duration_s}s): {summary}")
-
-        # Capture state after summary generation, immediately before logging.
-        booked = is_booking_complete(call_id)
-        transferred = was_transfer_complete(call_id)
-        transfer_state = get_transfer_state(call_id)
-        booking_log_state = get_booking_log_state(call_id)
-        sms_consented = has_sms_consent(call_id)
-        dashboard_owned_transfer = not should_write_final_call_log(call_id)
-        transfer_status = transfer_state.get("transfer_status")
-        callback_requested = bool(transfer_state.get("callback_requested"))
-        pending_transfer = get_pending_transfer_state(call_id)
-        if pending_transfer.get("terminal_logged"):
-            transfer_status = pending_transfer.get("transfer_status") or transfer_status
-            callback_requested = bool(pending_transfer.get("callback_requested"))
-            if pending_transfer.get("summary"):
-                summary = pending_transfer["summary"]
-
-        # Determine call outcome
-        if booked:
-            outcome = "booked"
-        elif callback_requested or transfer_status in ("failed", "unavailable_no_forwarding_phone"):
-            outcome = "callback_requested"
-        elif transferred or transfer_status in ("requested", "dialing", "completed"):
-            outcome = "transferred"
-        elif duration_s < 10:
-            outcome = "voicemail"
-        else:
-            outcome = "info_only"
-
-        caller_name = str(booking_log_state.get("caller_name") or "")
-        appointment_date = str(booking_log_state.get("appointment_date") or "")
-
-        if not dashboard_owned_transfer:
-            update_pending_transfer_snapshot(
-                call_id,
-                duration=duration_s,
-                summary=summary or "",
-                from_number=saved_caller or "",
-                to_number=saved_twilio_number,
-                config=saved_config,
-                sms_consent=sms_consented,
-                callback_requested=callback_requested,
-                callback_due_at=transfer_state.get("callback_due_at"),
-                caller_name=caller_name,
-                appointment_date=appointment_date,
-            )
-
-        latest_pending_transfer = get_pending_transfer_state(call_id)
-        if latest_pending_transfer.get("terminal_logged"):
-            transfer_status = latest_pending_transfer.get("transfer_status") or transfer_status
-            callback_requested = bool(latest_pending_transfer.get("callback_requested"))
-            if latest_pending_transfer.get("summary"):
-                summary = latest_pending_transfer["summary"]
-            outcome = "callback_requested" if callback_requested or transfer_status == "failed" else "transferred"
-
-        # Dashboard-routed transfers are finalized by dashboard Twilio callbacks.
-        # A normal phone-agent call-log update here can arrive late and downgrade
-        # dashboard_answered/handoff_answered back to requested/dialing.
-        if dashboard_owned_transfer:
-            logger.info(f"Skipping phone-agent final call log for dashboard-owned transfer {call_id}")
-            clear_pending_transfer(call_id)
-        else:
-            # Log call to dashboard and wait briefly so the process cannot exit before
-            # the POST is sent. Dashboard returns 201 on create and 200 on duplicate update.
-            try:
-                await asyncio.wait_for(
-                    log_call_to_dashboard(
-                        config=saved_config,
-                        twilio_call_sid=call_id,
-                        from_number=saved_caller or "",
-                        to_number=saved_twilio_number,
-                        duration=duration_s,
-                        outcome=outcome,
-                        summary=summary or "",
-                        caller_name=caller_name,
-                        appointment_date=appointment_date,
-                        sms_consent=sms_consented,
-                        transfer_reason=transfer_state.get("transfer_reason"),
-                        transfer_status=transfer_status,
-                        callback_requested=callback_requested,
-                        callback_due_at=transfer_state.get("callback_due_at"),
-                    ),
-                    timeout=CALL_LOG_WAIT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"Timed out logging call {call_id} to dashboard")
-
-        clear_pending_transfer_if_terminal(call_id)
-
-        # Clean up per-call context after all state-dependent work is done.
-        clear_call_context(call_id)
-
-        # Schedule automated follow-up SMS only if consent was explicitly given
-        if not booked and not dashboard_owned_transfer and saved_caller and sms_consented is True:
-            asyncio.create_task(
-                _delayed_followup_sms(saved_caller, saved_config, delay_seconds=300)
-            )
-
+    @transport.event_handler("on_client_disconnected")
+    async def on_disconnected(transport, client):
+        logger.info(f"Call disconnected: {call_id}")
+        await _finalize_call("client_disconnected")
         await task.cancel()
 
     # ── Pre-Booking Silence Watcher ────────────────────
@@ -1050,4 +1141,10 @@ async def run_bot(
 
     # ── Run ─────────────────────────────────────────────
     runner = PipelineRunner()
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    finally:
+        # The disconnect handler covers a caller hangup. This covers every call
+        # the agent ends itself, where that handler never fires. Whichever runs
+        # first claims the guard; the other returns immediately.
+        await _finalize_call("pipeline_ended")

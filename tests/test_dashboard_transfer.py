@@ -18,7 +18,6 @@ class FakeParams:
 class DashboardTransferTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         handlers._call_contexts.clear()
-        handlers._pending_transfers.clear()
         handlers._terminal_transfer_states.clear()
         self.call_sid = "CA-DASHBOARD"
         self.token = handlers._current_call_sid.set(self.call_sid)
@@ -30,16 +29,23 @@ class DashboardTransferTests(unittest.IsolatedAsyncioTestCase):
                 "companyName": "Transfer Test Co",
                 "twilioNumber": "+15550000000",
                 "agentSecret": "secret",
+                # Open every hour of every day. These tests cover the in-hours
+                # transfer path; without explicit hours they would inherit the
+                # 7am-7pm default and start failing overnight. The after-hours
+                # refusal has its own tests in test_after_hours_handoff.py.
+                "timezone": "America/Chicago",
+                "businessDays": [0, 1, 2, 3, 4, 5, 6],
+                "businessStart": 0,
+                "businessEnd": 24,
             },
         )
 
     def tearDown(self):
         handlers._current_call_sid.reset(self.token)
         handlers._call_contexts.clear()
-        handlers._pending_transfers.clear()
         handlers._terminal_transfer_states.clear()
 
-    async def test_dashboard_transfer_does_not_create_legacy_pending_transfer(self):
+    async def test_the_ai_never_updates_twilio_directly(self):
         params = FakeParams({"reason": "Caller asked for dispatch"})
         redirect_mock = AsyncMock(return_value=DashboardLiveRedirectResult(ok=True, status=200))
 
@@ -64,7 +70,6 @@ class DashboardTransferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(redirect_kwargs["origin"], "phone_agent_ai_transfer")
         self.assertEqual(redirect_kwargs["dashboard_url"], "https://dashboard.example.com")
         self.assertEqual(redirect_kwargs["platform_api_key"], "platform-secret")
-        self.assertEqual(handlers.get_pending_transfer_state(self.call_sid), {})
         self.assertTrue(handlers.is_dashboard_owned_transfer(self.call_sid))
         self.assertFalse(bot.should_write_final_call_log(self.call_sid))
         self.assertEqual(params.results[0]["transferStatus"], "dashboard_redirected")
@@ -79,18 +84,3 @@ class DashboardTransferTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bot.should_write_final_call_log(self.call_sid))
         self.assertEqual(handlers.get_transfer_state(self.call_sid)["transfer_status"], "failed")
         self.assertEqual(params.results[0]["transferred"], False)
-
-    def test_prune_stale_pending_transfers_removes_old_records_only(self):
-        now = 1_000_000.0
-        handlers._pending_transfers["old"] = {"created_at": now - 7_200, "updated_at": now - 7_200}
-        handlers._pending_transfers["fresh"] = {"created_at": now - 30, "updated_at": now - 30}
-
-        removed = handlers.prune_stale_pending_transfers(now=now, ttl_seconds=3_600)
-
-        self.assertEqual(removed, 1)
-        self.assertNotIn("old", handlers._pending_transfers)
-        self.assertIn("fresh", handlers._pending_transfers)
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -21,6 +21,11 @@ from config import DASHBOARD_URL, PLATFORM_API_KEY
 _cache: dict[str, tuple[dict[str, Any], float]] = {}
 CACHE_TTL = 300  # 5 minutes
 
+# Clients already warned about incomplete config. The TwiML webhook fetches with
+# force_refresh=True on every inbound call, so without this the warning repeats
+# once per call for the life of the process.
+_warned_incomplete: set[str] = set()
+
 
 async def get_client_config(client_id: str, force_refresh: bool = False) -> dict[str, Any]:
     """Fetch client config from dashboard, with caching."""
@@ -58,6 +63,33 @@ async def get_client_config(client_id: str, force_refresh: bool = False) -> dict
             f"Operator must set this in dashboard settings."
         )
 
+    # Fields the prompt renders into spoken sentences. The dashboard sends every
+    # key with an empty-string fallback, so a blank one is indistinguishable from
+    # a field the operator never filled in. The prompt omits the whole clause
+    # rather than speaking a fragment, which is invisible from the caller's side
+    # — so say it here, once per config fetch.
+    missing = [
+        label
+        for label, value in (
+            ("city", config.get("city")),
+            ("state", config.get("state")),
+            ("serviceArea", config.get("serviceArea")),
+            ("services", config.get("services")),
+        )
+        if not value
+    ]
+    if config.get("companyName") in (None, "", "Junk Removal"):
+        missing.append("businessName")
+    if missing and client_id not in _warned_incomplete:
+        _warned_incomplete.add(client_id)
+        logger.warning(
+            f"Config fields empty for client {client_id} "
+            f"({config.get('companyName', 'unknown')}): {', '.join(missing)}. "
+            f"The agent leaves these out of what it says, or falls back to a "
+            f"generic phrase, rather than speaking a partial sentence. "
+            f"Operator must set them in dashboard settings."
+        )
+
     return config
 
 
@@ -65,5 +97,7 @@ def clear_cache(client_id: str | None = None):
     """Clear cache for a specific client or all clients."""
     if client_id:
         _cache.pop(client_id, None)
+        _warned_incomplete.discard(client_id)
     else:
         _cache.clear()
+        _warned_incomplete.clear()

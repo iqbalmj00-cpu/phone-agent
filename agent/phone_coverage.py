@@ -41,20 +41,6 @@ class WeeklyHoursEvaluation:
     error: str | None = None
 
 
-def normalize_e164_phone(value: Any) -> str | None:
-    text = str(value or "").strip()
-    digits = re.sub(r"\D+", "", text)
-    if not digits:
-        return None
-    if text.startswith("+") and 10 <= len(digits) <= 15:
-        return f"+{digits}"
-    if len(digits) == 10:
-        return f"+1{digits}"
-    if len(digits) == 11 and digits.startswith("1"):
-        return f"+{digits}"
-    return None
-
-
 def _handoff(mode: str, reason: str, error: str | None = None) -> CoverageDecision:
     return CoverageDecision(
         mode=mode,
@@ -211,22 +197,6 @@ def resolve_phone_coverage_decision(config: dict[str, Any], now: datetime | None
     )
 
 
-def build_transfer_status_action_url(
-    base_url: str,
-    client_id: str,
-    call_sid: str,
-    reason: str,
-) -> str:
-    if not base_url or not call_sid:
-        return ""
-    path = (
-        f"{base_url.rstrip('/')}/transfer-status/"
-        f"{quote(str(client_id), safe='')}/{quote(str(call_sid), safe='')}"
-    )
-    query = urlencode({"reason": reason}) if reason else ""
-    return f"{path}?{query}" if query else path
-
-
 def build_dashboard_handoff_redirect_twiml(
     *,
     company_name: Any,
@@ -255,45 +225,6 @@ def build_dashboard_handoff_redirect_twiml(
         "<Response>"
         f'<Say voice="Polly.Joanna">Please hold while we connect you with {escape(str(company_name or "our team"))}.</Say>'
         f'<Redirect method="POST">{escape(redirect_url)}</Redirect>'
-        "</Response>"
-    )
-
-
-def build_handoff_twiml(
-    *,
-    company_name: Any,
-    forwarding_phone: Any,
-    caller_id: Any = "",
-    base_url: str = "",
-    client_id: str = "",
-    call_sid: str = "",
-    reason: str = "phone_coverage_off",
-) -> str | None:
-    normalized_forwarding_phone = normalize_e164_phone(forwarding_phone)
-    if not normalized_forwarding_phone:
-        return None
-
-    action_url = build_transfer_status_action_url(base_url, client_id, call_sid, reason)
-    dial_attrs = ['timeout="25"']
-    normalized_caller_id = normalize_e164_phone(caller_id)
-    if normalized_caller_id:
-        dial_attrs.append(f"callerId={quoteattr(normalized_caller_id)}")
-    if action_url:
-        dial_attrs.append(f"action={quoteattr(action_url)}")
-        dial_attrs.append('method="POST"')
-
-    post_dial_fallback = (
-        ""
-        if action_url
-        else '<Say voice="Polly.Joanna">We were unable to reach anyone at this time. Please try again later. Goodbye.</Say>'
-    )
-    dial_attr_str = " ".join(dial_attrs)
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response>"
-        f'<Say voice="Polly.Joanna">Please hold while we connect you with {escape(str(company_name or "our team"))}.</Say>'
-        f"<Dial {dial_attr_str}>{escape(normalized_forwarding_phone)}</Dial>"
-        f"{post_dial_fallback}"
         "</Response>"
     )
 

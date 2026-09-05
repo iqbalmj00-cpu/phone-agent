@@ -299,10 +299,17 @@ class LookupHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["verified"])
         self.assertEqual(result["error"], "identity_verification_failed")
-        # Hand off to a person — explicitly not a callback, which would let an
-        # unverified caller choose where the business rings back to.
+        # Hand off to a person. Under D26 a callback is now allowed here: the
+        # callback number is the Twilio `From` for this call, never a number the
+        # caller supplied, so an unverified caller cannot steer where the
+        # business rings back to. What must still never leak is the booking.
         self.assertIn("transfer_to_human", result["message"])
-        self.assertIn("do not offer a callback", result["message"].lower())
+        lowered = result["message"].lower()
+        self.assertIn("do not reveal any detail", lowered)
+        self.assertIn("do not offer another attempt", lowered)
+        for leaked in ("jane", "99 elm", "elm road"):
+            with self.subTest(leaked=leaked):
+                self.assertNotIn(leaked, lowered)
         self.assertNotIn("jobs", result)
         self.assertFalse(handlers.is_identity_verified(self.call_sid, OWNER))
 

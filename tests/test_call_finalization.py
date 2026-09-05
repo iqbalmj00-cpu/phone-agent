@@ -53,25 +53,30 @@ class OnceGuardTests(unittest.TestCase):
         self.assertTrue(second.claim())
 
 
-class RunPostCallTests(unittest.IsolatedAsyncioTestCase):
+class _PostCallHarness(unittest.IsolatedAsyncioTestCase):
+    """Shared setup. No tests of its own, so nothing runs twice."""
+
     def setUp(self):
         handlers._call_contexts.clear()
-        handlers._pending_transfers.clear()
+        # A terminal transfer state outlives clear_call_context by design, so it
+        # leaks between tests that reuse this call sid unless it is cleared too.
+        handlers._terminal_transfer_states.clear()
         handlers.set_call_context(
             CALL_SID, CALLER, {"companyName": "Test Co", "twilioNumber": TWILIO_NUMBER}
         )
 
     def tearDown(self):
         handlers._call_contexts.clear()
-        handlers._pending_transfers.clear()
+        handlers._terminal_transfer_states.clear()
 
     async def _run(self, *, messages=None, summary="Caller asked about pricing."):
         """Drive run_post_call with the two network calls stubbed out."""
         started = datetime.now(ZoneInfo(TZ)) - timedelta(seconds=90)
         logged = AsyncMock()
+        self.lead = AsyncMock(return_value=True)
         with patch.object(bot, "_summarize_call_with_anthropic", AsyncMock(return_value=summary)), \
-             patch.object(bot, "log_call_to_dashboard", logged), \
-             patch.object(bot, "_delayed_followup_sms", AsyncMock()) as followup:
+             patch.object(bot, "create_lead_from_call", self.lead), \
+             patch.object(bot, "log_call_to_dashboard", logged):
             await bot.run_post_call(
                 call_id=CALL_SID,
                 caller_number=CALLER,
@@ -83,14 +88,14 @@ class RunPostCallTests(unittest.IsolatedAsyncioTestCase):
                 call_start_time=started,
                 timezone=TZ,
             )
-            # Let any follow-up SMS task scheduled by create_task actually start.
-            await asyncio.sleep(0)
-        return logged, followup
+        return logged
 
+
+class RunPostCallTests(_PostCallHarness):
     async def test_a_booked_call_is_logged_as_booked(self):
         handlers.mark_booking_complete(CALL_SID, {"caller_name": "Jane", "appointment_date": "2026-08-11"})
 
-        logged, _ = await self._run()
+        logged = await self._run()
 
         self.assertEqual(logged.await_count, 1)
         kwargs = logged.await_args.kwargs
@@ -103,7 +108,7 @@ class RunPostCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(kwargs["duration"], 0)
 
     async def test_an_ordinary_call_is_logged_as_info_only(self):
-        logged, _ = await self._run()
+        logged = await self._run()
 
         self.assertEqual(logged.await_args.kwargs["outcome"], "info_only")
 
@@ -115,7 +120,7 @@ class RunPostCallTests(unittest.IsolatedAsyncioTestCase):
         """
         handlers.mark_dashboard_transfer_ownership(CALL_SID, "ai_transfer", reason="caller_requested")
 
-        logged, _ = await self._run()
+        logged = await self._run()
 
         self.assertEqual(logged.await_count, 0)
 
@@ -135,27 +140,6 @@ class RunPostCallTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(CALL_SID, handlers._call_contexts)
 
-    async def test_follow_up_sms_is_sent_when_they_consented_and_did_not_book(self):
-        handlers.mark_sms_consent(CALL_SID, True)
-
-        _, followup = await self._run()
-
-        self.assertEqual(followup.call_count, 1)
-
-    async def test_no_follow_up_sms_without_consent(self):
-        _, followup = await self._run()
-
-        self.assertEqual(followup.call_count, 0)
-
-    async def test_no_follow_up_sms_after_a_booking(self):
-        """They just booked — the follow-up is for callers who didn't."""
-        handlers.mark_sms_consent(CALL_SID, True)
-        handlers.mark_booking_complete(CALL_SID, {})
-
-        _, followup = await self._run()
-
-        self.assertEqual(followup.call_count, 0)
-
     async def test_a_booking_still_in_flight_is_waited_for(self):
         """The ghost-booking guard.
 
@@ -170,7 +154,7 @@ class RunPostCallTests(unittest.IsolatedAsyncioTestCase):
 
         handlers.add_inflight_task(CALL_SID, asyncio.create_task(_slow_booking()))
 
-        logged, _ = await self._run()
+        logged = await self._run()
 
         self.assertEqual(logged.await_args.kwargs["outcome"], "booked")
         self.assertEqual(logged.await_args.kwargs["caller_name"], "Jane")
@@ -184,13 +168,13 @@ class RunPostCallTests(unittest.IsolatedAsyncioTestCase):
         handlers.add_inflight_task(CALL_SID, stuck)
 
         with patch.object(bot, "INFLIGHT_TASK_WAIT_SECONDS", 0.01):
-            logged, _ = await self._run()
+            logged = await self._run()
 
         self.assertEqual(logged.await_count, 1)
         stuck.cancel()
 
     async def test_a_silent_call_still_produces_a_log(self):
-        logged, _ = await self._run(messages=[])
+        logged = await self._run(messages=[])
 
         self.assertEqual(logged.await_count, 1)
         self.assertIn("No caller conversation captured", logged.await_args.kwargs["summary"])
@@ -205,8 +189,7 @@ class RunPostCallTests(unittest.IsolatedAsyncioTestCase):
         logged = AsyncMock()
         with patch.object(bot, "SUMMARY_WAIT_SECONDS", 0.01), \
              patch.object(bot, "_summarize_call_with_anthropic", _never_finishes), \
-             patch.object(bot, "log_call_to_dashboard", logged), \
-             patch.object(bot, "_delayed_followup_sms", AsyncMock()):
+             patch.object(bot, "log_call_to_dashboard", logged):
             await bot.run_post_call(
                 call_id=CALL_SID,
                 caller_number=CALLER,
@@ -221,6 +204,123 @@ class RunPostCallTests(unittest.IsolatedAsyncioTestCase):
         summary = logged.await_args.kwargs["summary"]
         self.assertIn("AI summary unavailable", summary)
         self.assertIn("mattresses", summary)
+
+
+class CallLogRetryTests(_PostCallHarness):
+    """The retry has to key on the result, not on a timeout that cannot fire.
+
+    `log_call_to_dashboard` carries its own 10s client timeout and turns every
+    failure into `False`, so the 12s `wait_for` around it almost never raises.
+    An earlier version retried on `asyncio.TimeoutError` and was therefore dead
+    code for the dashboard hang it existed to cover.
+    """
+
+    async def _run_with(self, results):
+        logged = AsyncMock(side_effect=list(results))
+        with patch.object(bot, "_summarize_call_with_anthropic", AsyncMock(return_value="x")), \
+             patch.object(bot, "create_lead_from_call", AsyncMock(return_value=True)), \
+             patch.object(bot, "log_call_to_dashboard", logged):
+            await bot.run_post_call(
+                call_id=CALL_SID,
+                caller_number=CALLER,
+                client_config={"companyName": "Test Co", "twilioNumber": TWILIO_NUMBER},
+                context=FakeContext([{"role": "user", "content": "hi"}]),
+                call_start_time=datetime.now(ZoneInfo(TZ)) - timedelta(seconds=90),
+                timezone=TZ,
+            )
+        return logged
+
+    async def test_a_refused_log_is_retried_once(self):
+        logged = await self._run_with([False, True])
+        self.assertEqual(logged.await_count, 2)
+
+    async def test_a_successful_log_is_not_retried(self):
+        logged = await self._run_with([True])
+        self.assertEqual(logged.await_count, 1)
+
+    async def test_it_gives_up_after_two_attempts(self):
+        """Never a third: each POST is cheap, but a loop is not."""
+        logged = await self._run_with([False, False])
+        self.assertEqual(logged.await_count, 2)
+
+
+class LeadCaptureGateTests(_PostCallHarness):
+    """Who becomes a lead, and — more importantly — who does not.
+
+    D12 supplies the name gate. D27 supplies the outcome gate: a caller already
+    sitting in the dashboard's Callback Queue must not also be captured as a
+    lead, or the follow-up cron cold-texts someone the operator is meant to be
+    ringing back.
+    """
+
+    async def test_a_named_caller_who_did_not_book_becomes_a_lead(self):
+        handlers.mark_caller_name(CALL_SID, "Jane")
+
+        await self._run(summary="Caller wants a garage cleared next week.")
+
+        self.lead.assert_awaited_once()
+        kwargs = self.lead.await_args.kwargs
+        self.assertEqual(kwargs["name"], "Jane")
+        self.assertEqual(kwargs["phone"], CALLER)
+        self.assertEqual(kwargs["description"], "Caller wants a garage cleared next week.")
+
+    async def test_no_name_means_no_lead(self):
+        """D12, enforced in code rather than trusted to the prompt."""
+        await self._run()
+        self.lead.assert_not_awaited()
+
+    async def test_a_booked_caller_is_not_also_a_lead(self):
+        handlers.mark_caller_name(CALL_SID, "Jane")
+        handlers.mark_booking_complete(CALL_SID, {"caller_name": "Jane"})
+
+        await self._run()
+
+        self.lead.assert_not_awaited()
+
+    async def test_an_after_hours_refusal_is_not_a_lead(self):
+        """D27. This caller is already in the Callback Queue."""
+        handlers.mark_caller_name(CALL_SID, "Jane")
+        handlers.mark_transfer_state(
+            CALL_SID, "suppressed_after_hours", "asked for a person", callback_requested=True
+        )
+
+        await self._run()
+
+        self.lead.assert_not_awaited()
+
+    async def test_a_failed_transfer_is_not_a_lead(self):
+        handlers.mark_caller_name(CALL_SID, "Jane")
+        handlers.mark_transfer_state(CALL_SID, "failed", "transfer blew up", callback_requested=True)
+
+        await self._run()
+
+        self.lead.assert_not_awaited()
+
+    async def test_a_scheduled_callback_is_not_a_lead(self):
+        handlers.mark_caller_name(CALL_SID, "Jane")
+        handlers.mark_callback_requested(CALL_SID, "2026-09-10T14:00:00-05:00", "wants a call back")
+
+        await self._run()
+
+        self.lead.assert_not_awaited()
+
+    async def test_a_failed_summary_still_produces_a_lead_without_a_description(self):
+        """The description renders verbatim to the operator, so no machine text."""
+        handlers.mark_caller_name(CALL_SID, "Jane")
+
+        await self._run(summary="Summary unavailable")
+
+        self.lead.assert_awaited_once()
+        self.assertEqual(self.lead.await_args.kwargs["description"], "")
+
+    async def test_the_name_is_read_before_the_context_is_cleared(self):
+        """`clear_call_context` runs one statement later and wipes the name."""
+        handlers.mark_caller_name(CALL_SID, "Jane")
+
+        await self._run()
+
+        self.assertEqual(self.lead.await_args.kwargs["name"], "Jane")
+        self.assertEqual(handlers.get_caller_name(CALL_SID), "")
 
 
 if __name__ == "__main__":

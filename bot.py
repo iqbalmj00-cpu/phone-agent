@@ -69,7 +69,7 @@ from config import (
     TWILIO_ACCOUNT_SID,
     TWILIO_AUTH_TOKEN,
 )
-from agent.prompt import build_system_prompt, client_supports_dumpsters
+from agent.prompt import build_greeting, build_system_prompt, client_supports_dumpsters
 from agent.handlers import (
     handle_create_booking,
     handle_check_container_availability,
@@ -81,6 +81,7 @@ from agent.handlers import (
     handle_schedule_callback,
     handle_transfer_to_human,
     handle_validate_promo_code,
+    handle_record_caller_name,
     handle_record_sms_consent,
     handle_verify_address,
     set_call_context,
@@ -90,22 +91,19 @@ from agent.handlers import (
     was_transfer_complete,
     get_transfer_state,
     get_booking_log_state,
+    create_lead_from_call,
+    get_caller_name,
     has_sms_consent,
-    send_automated_followup,
+    usable_inquiry,
     log_call_to_dashboard,
     get_inflight_tasks,
-    update_pending_transfer_snapshot,
-    get_pending_transfer_state,
     is_dashboard_owned_transfer,
-    clear_pending_transfer,
-    clear_pending_transfer_if_terminal,
     _current_call_sid,
 )
 
 
 # ── Automated Follow-Up SMS ─────────────────────────────
 
-FOLLOWUP_DELAY_SECONDS = 300  # 5 minutes
 INFLIGHT_TASK_WAIT_SECONDS = 17  # Covers 15s dashboard tool calls plus small scheduling overhead
 CALL_LOG_WAIT_SECONDS = 12
 SUMMARY_WAIT_SECONDS = 8
@@ -124,23 +122,6 @@ CARTESIA_SPEED_PRESETS = {
 def should_write_final_call_log(call_id: str) -> bool:
     """Final phone-agent logs must not overwrite dashboard-owned transfer results."""
     return not is_dashboard_owned_transfer(call_id)
-
-
-async def _delayed_followup_sms(caller_number: str, config: dict, delay_seconds: int = FOLLOWUP_DELAY_SECONDS):
-    """Wait, then send automated follow-up SMS to callers who didn't book."""
-    try:
-        company = config.get("companyName", "unknown")
-        logger.info(f"Scheduled follow-up SMS for {caller_number} ({company}) in {delay_seconds}s")
-        await asyncio.sleep(delay_seconds)
-        sent = await send_automated_followup(caller_number, config, sms_consented=True)
-        if sent:
-            logger.info(f"Follow-up SMS delivered to {caller_number} ({company})")
-        else:
-            logger.info(f"Follow-up SMS skipped for {caller_number} ({company}) — gates not met")
-    except asyncio.CancelledError:
-        logger.debug(f"Follow-up SMS cancelled for {caller_number}")
-    except Exception as e:
-        logger.error(f"Follow-up SMS error for {caller_number}: {e}")
 
 
 class CallerSpeechTracker(FrameProcessor):
@@ -306,17 +287,26 @@ def _cartesia_speed_multiplier(value: str) -> float:
 
 
 async def _summarize_call_with_anthropic(transcript_messages: list[dict]) -> str:
-    transcript = _format_transcript_lines(transcript_messages[-10:])
+    # The caller says why they rang in the FIRST turn or two. A trailing
+    # ten-message window discards exactly that on any call past a few
+    # exchanges, and this summary is what an operator reads to decide who to
+    # call back. Nothing truncates `context.messages` upstream, and a call is
+    # capped at ten minutes, so the whole conversation is a few thousand
+    # tokens — cheap to send in full.
+    transcript = _format_transcript_lines(transcript_messages)
     client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
     response = await client.messages.create(
         model=ANTHROPIC_UTILITY_MODEL,
-        max_tokens=100,
+        max_tokens=200,  # the instruction caps the length; this is headroom for the second sentence
         temperature=0,
         system=(
-            "Summarize this phone call in one sentence using only the caller "
-            "and agent transcript provided. Do not infer that a booking, "
-            "cancellation, reschedule, transfer, or callback happened unless "
-            "it is explicitly present in the transcript."
+            "Summarize this phone call in one or two sentences using only the "
+            "caller and agent transcript provided. Lead with what the caller "
+            "actually wanted — the job, the item, the problem, or the question "
+            "they rang about — because that is what the operator needs in order "
+            "to call them back. Do not infer that a booking, cancellation, "
+            "reschedule, transfer, or callback happened unless it is explicitly "
+            "present in the transcript."
         ),
         messages=[{"role": "user", "content": f"Transcript:\n{transcript}"}],
     )
@@ -452,13 +442,6 @@ async def run_post_call(
     dashboard_owned_transfer = not should_write_final_call_log(call_id)
     transfer_status = transfer_state.get("transfer_status")
     callback_requested = bool(transfer_state.get("callback_requested"))
-    pending_transfer = get_pending_transfer_state(call_id)
-    if pending_transfer.get("terminal_logged"):
-        transfer_status = pending_transfer.get("transfer_status") or transfer_status
-        callback_requested = bool(pending_transfer.get("callback_requested"))
-        if pending_transfer.get("summary"):
-            summary = pending_transfer["summary"]
-
     # Determine call outcome
     if booked:
         outcome = "booked"
@@ -471,75 +454,83 @@ async def run_post_call(
     else:
         outcome = "info_only"
 
-    caller_name = str(booking_log_state.get("caller_name") or "")
+    caller_name = str(booking_log_state.get("caller_name") or "") or get_caller_name(call_id)
     appointment_date = str(booking_log_state.get("appointment_date") or "")
-
-    if not dashboard_owned_transfer:
-        update_pending_transfer_snapshot(
-            call_id,
-            duration=duration_s,
-            summary=summary or "",
-            from_number=saved_caller or "",
-            to_number=saved_twilio_number,
-            config=saved_config,
-            sms_consent=sms_consented,
-            callback_requested=callback_requested,
-            callback_due_at=transfer_state.get("callback_due_at"),
-            caller_name=caller_name,
-            appointment_date=appointment_date,
-        )
-
-    latest_pending_transfer = get_pending_transfer_state(call_id)
-    if latest_pending_transfer.get("terminal_logged"):
-        transfer_status = latest_pending_transfer.get("transfer_status") or transfer_status
-        callback_requested = bool(latest_pending_transfer.get("callback_requested"))
-        if latest_pending_transfer.get("summary"):
-            summary = latest_pending_transfer["summary"]
-        outcome = "callback_requested" if callback_requested or transfer_status == "failed" else "transferred"
 
     # Dashboard-routed transfers are finalized by dashboard Twilio callbacks.
     # A normal phone-agent call-log update here can arrive late and downgrade
     # dashboard_answered/handoff_answered back to requested/dialing.
     if dashboard_owned_transfer:
         logger.info(f"Skipping phone-agent final call log for dashboard-owned transfer {call_id}")
-        clear_pending_transfer(call_id)
     else:
         # Log call to dashboard and wait briefly so the process cannot exit before
         # the POST is sent. Dashboard returns 201 on create and 200 on duplicate update.
-        try:
-            await asyncio.wait_for(
-                log_call_to_dashboard(
-                    config=saved_config,
-                    twilio_call_sid=call_id,
-                    from_number=saved_caller or "",
-                    to_number=saved_twilio_number,
-                    duration=duration_s,
-                    outcome=outcome,
-                    summary=summary or "",
-                    caller_name=caller_name,
-                    appointment_date=appointment_date,
-                    sms_consent=sms_consented,
-                    transfer_reason=transfer_state.get("transfer_reason"),
-                    transfer_status=transfer_status,
-                    callback_requested=callback_requested,
-                    callback_due_at=transfer_state.get("callback_due_at"),
-                ),
-                timeout=CALL_LOG_WAIT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"Timed out logging call {call_id} to dashboard")
+        #
+        # Retry on the RESULT, not on a timeout. `log_call_to_dashboard` sets its
+        # own 10s client timeout and swallows every failure into `False`, so the
+        # 12s wait_for below almost never raises — an earlier version retried on
+        # `asyncio.TimeoutError` and could therefore never fire at all. Retrying
+        # is safe because the route looks the call up by its Twilio SID and
+        # updates rather than inserting; lead capture below has no such key and
+        # is never retried.
+        log_args = dict(
+            config=saved_config,
+            twilio_call_sid=call_id,
+            from_number=saved_caller or "",
+            to_number=saved_twilio_number,
+            duration=duration_s,
+            outcome=outcome,
+            summary=summary or "",
+            caller_name=caller_name,
+            appointment_date=appointment_date,
+            sms_consent=sms_consented,
+            transfer_reason=transfer_state.get("transfer_reason"),
+            transfer_status=transfer_status,
+            callback_requested=callback_requested,
+            callback_due_at=transfer_state.get("callback_due_at"),
+        )
+        logged = False
+        for attempt in (1, 2):
+            try:
+                logged = await asyncio.wait_for(
+                    log_call_to_dashboard(**log_args),
+                    timeout=CALL_LOG_WAIT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logged = False
+            if logged:
+                break
+            if attempt == 1:
+                logger.warning(f"Call log for {call_id} did not land; retrying once")
+        if not logged:
+            logger.error(f"Call log for {call_id} failed twice; giving up")
 
-    clear_pending_transfer_if_terminal(call_id)
+    # A caller who gave their name but did not book is still worth recording —
+    # that is the whole reason the opening line asks who is calling (D12).
+    #
+    # Only `info_only` qualifies. Every other outcome is already accounted for
+    # somewhere: `booked` has a job, `voicemail` has nobody on the line, and
+    # every route to `callback_requested` — the after-hours handoff refusal, an
+    # explicitly scheduled callback, and a failed transfer — has already put the
+    # caller in the dashboard's Callback Queue. Making those a lead as well
+    # would cold-text someone the operator is already meant to be ringing back
+    # (D27).
+    #
+    # This runs BEFORE clear_call_context below, which wipes the context that
+    # `caller_name` was read from.
+    if outcome == "info_only" and not dashboard_owned_transfer and caller_name and saved_caller:
+        await create_lead_from_call(
+            config=saved_config,
+            name=caller_name,
+            phone=saved_caller,
+            description=usable_inquiry(summary or ""),
+            sms_consent=sms_consented is True,
+        )
 
     # Clean up per-call context after all state-dependent work is done. This also
     # drops the retained PipelineTask, which holds a per-call VAD session.
     clear_call_context(call_id)
 
-    # Schedule automated follow-up SMS only if consent was explicitly given
-    if not booked and not dashboard_owned_transfer and saved_caller and sms_consented is True:
-        asyncio.create_task(
-            _delayed_followup_sms(saved_caller, saved_config, delay_seconds=300)
-        )
 
 
 # ── Tool Definitions ────────────────────────────────────
@@ -734,6 +725,14 @@ def build_tools(dumpster_enabled: bool) -> ToolsSchema:
             required=["date"],
         ),
         FunctionSchema(
+            name="record_caller_name",
+            description="Record the caller's name. Call this as soon as they tell you who they are — usually in answer to the opening line. Call it once. If they never give a name, do not call this and do not keep asking.",
+            properties={
+                "name": {"type": "string", "description": "The caller's name exactly as they said it. Do not guess, and do not pass a placeholder like 'unknown' or 'customer'."},
+            },
+            required=["name"],
+        ),
+        FunctionSchema(
             name="record_sms_consent",
             description="Record whether the caller consented to receiving text messages. Call this IMMEDIATELY after asking for SMS consent and receiving a clear yes or no answer. You MUST call this before any text-related action.",
             properties={
@@ -781,7 +780,7 @@ async def run_bot(
     last_caller_speech_time = datetime.now(ZoneInfo(timezone))
 
     # ── Greeting ────────────────────────────────────────
-    greeting = f"Thanks for calling {company_name}, this is {agent_name}, how can I help you?"
+    greeting = build_greeting(company_name, agent_name)
 
     # ── Transport ───────────────────────────────────────
     transport = FastAPIWebsocketTransport(
@@ -905,6 +904,7 @@ async def run_bot(
     )
     llm.register_function("validate_promo_code", handle_validate_promo_code)
     llm.register_function("check_available_slots", handle_check_available_slots)
+    llm.register_function("record_caller_name", handle_record_caller_name)
     llm.register_function("record_sms_consent", handle_record_sms_consent)
     llm.register_function("verify_address", handle_verify_address)
 

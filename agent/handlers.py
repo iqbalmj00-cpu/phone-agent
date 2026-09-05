@@ -20,7 +20,7 @@ import json
 import re
 import time
 import aiohttp
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -28,6 +28,7 @@ from loguru import logger
 from pipecat.services.llm_service import FunctionCallParams
 
 from agent.business_hours import (
+    evaluate_current_business_hours,
     format_business_hours_for_day as _shared_format_business_hours_for_day,
     is_business_hours as _shared_is_business_hours,
     is_open_day as _shared_is_open_day,
@@ -52,28 +53,10 @@ _current_call_sid: contextvars.ContextVar[str] = contextvars.ContextVar("current
 
 # Twilio <Dial action> callbacks arrive after the media stream has ended, so
 # transfer state must outlive the normal per-call context.
-_pending_transfers: dict[str, dict[str, Any]] = {}
 _terminal_transfer_states: dict[str, dict[str, Any]] = {}
 _TRANSFER_SUCCESS_STATUSES = {"completed", "answered"}
 _TRANSFER_FAILURE_STATUSES = {"busy", "no-answer", "failed", "canceled"}
 _TRANSFER_TERMINAL_STATUSES = {"completed", "failed", "unavailable_no_forwarding_phone"}
-PENDING_TRANSFER_TTL_SECONDS = 60 * 60
-_TRANSFER_REASON_LABELS = {
-    "phone_coverage_off": "AI phone coverage is off for the current time",
-    "phone_coverage_always_handoff": "AI phone coverage is set to always handoff",
-    "phone_coverage_missing_mode": "AI phone coverage mode was missing from dashboard config",
-    "phone_coverage_unresolved_plan_default": "dashboard returned unresolved plan_default phone coverage mode",
-    "phone_coverage_invalid_mode": "dashboard returned an invalid phone coverage mode",
-    "phone_coverage_invalid_timezone": "the configured timezone could not be evaluated",
-    "phone_coverage_business_hours_invalid": "business hours could not be evaluated for AI phone coverage",
-    "phone_coverage_custom_hours_invalid": "custom AI phone coverage hours are missing or invalid",
-}
-
-
-def sanitize_transfer_reason_token(reason: str | None) -> str:
-    """Return a known transfer reason token, or empty string for untrusted input."""
-    token = str(reason or "").strip()
-    return token if token in _TRANSFER_REASON_LABELS else ""
 
 
 def set_call_context(call_sid: str, caller_number: str, client_config: dict[str, Any]):
@@ -94,6 +77,13 @@ def mark_booking_complete(call_sid: str, details: dict[str, Any] | None = None):
     """Flag that a booking was successfully created for this call."""
     if call_sid in _call_contexts:
         _call_contexts[call_sid]["booking_complete"] = True
+        # A caller refused a handoff after hours who then books does not need
+        # calling back — they got what they rang for. Leaving the flag set puts
+        # a completed booking in the Callback Queue, which is the one place that
+        # has to keep meaning "still needs attention". An explicitly scheduled
+        # callback is a different status and is left alone.
+        if _call_contexts[call_sid].get("transfer_status") == "suppressed_after_hours":
+            _call_contexts[call_sid]["callback_requested"] = False
         if details:
             current = _call_contexts[call_sid].setdefault("booking_details", {})
             current.update({k: v for k, v in details.items() if v is not None})
@@ -133,27 +123,16 @@ def get_booking_log_state(call_sid: str) -> dict[str, Any]:
     return dict(ctx.get("booking_details", {}))
 
 
-def mark_sms_sent(call_sid: str):
-    """Flag that an SMS was sent during this call (to avoid duplicate follow-ups)."""
-    if call_sid in _call_contexts:
-        _call_contexts[call_sid]["sms_sent"] = True
-
-
-def was_sms_sent(call_sid: str) -> bool:
-    """Check if an SMS was already sent during this call."""
-    ctx = _call_contexts.get(call_sid, {})
-    return ctx.get("sms_sent", False)
-
-
-def mark_transfer_complete(call_sid: str):
-    """Flag that the call was transferred to a human."""
-    if call_sid in _call_contexts:
-        _call_contexts[call_sid]["transfer_complete"] = True
-        _call_contexts[call_sid]["transfer_status"] = "completed"
-
-
 def was_transfer_complete(call_sid: str) -> bool:
-    """Check if a transfer was completed during this call."""
+    """Check if a transfer was completed during this call.
+
+    Nothing sets this any more. Its only writer was the Twilio transfer-status
+    callback, whose route was never reachable in production (the TwiML that
+    pointed at it was built by a function no live path called) and which has
+    since been removed. So this returns False for every call, and the outcome
+    ladder in `bot.py` is driven entirely by `transfer_status`. Kept because that
+    ladder still reads it; it is a no-op, not a signal.
+    """
     ctx = _call_contexts.get(call_sid, {})
     return ctx.get("transfer_complete", False)
 
@@ -241,119 +220,6 @@ def get_transfer_state(call_sid: str) -> dict[str, Any]:
     return state
 
 
-def _remember_pending_transfer(
-    call_sid: str,
-    config: dict[str, Any],
-    from_number: str,
-    reason: str,
-):
-    """Keep enough context to update the dashboard when Twilio reports Dial status."""
-    prune_stale_pending_transfers()
-    now = time.time()
-    _pending_transfers[call_sid] = {
-        "config": dict(config),
-        "from_number": from_number,
-        "to_number": config.get("twilioNumber", ""),
-        "reason": reason,
-        "created_at": now,
-        "updated_at": now,
-        "transfer_status": "requested",
-        "duration": 0,
-        "summary": "",
-        "sms_consent": None,
-        "callback_requested": False,
-        "callback_due_at": None,
-        "caller_name": None,
-        "appointment_date": None,
-    }
-
-
-def _update_pending_transfer_status(
-    call_sid: str,
-    status: str,
-    *,
-    callback_requested: bool = False,
-):
-    pending = _pending_transfers.get(call_sid)
-    if not pending:
-        return
-    pending["transfer_status"] = status
-    pending["updated_at"] = time.time()
-    if callback_requested:
-        pending["callback_requested"] = True
-
-
-def update_pending_transfer_snapshot(
-    call_sid: str,
-    *,
-    duration: int,
-    summary: str,
-    from_number: str,
-    to_number: str,
-    config: dict[str, Any],
-    sms_consent: bool | None,
-    callback_requested: bool,
-    callback_due_at: str | None = None,
-    caller_name: str | None = None,
-    appointment_date: str | None = None,
-):
-    """Refresh pending transfer metadata before final call-log write."""
-    pending = _pending_transfers.get(call_sid)
-    if not pending:
-        return
-    pending.update({
-        "duration": max(0, int(duration)),
-        "summary": summary,
-        "from_number": from_number,
-        "to_number": to_number,
-        "config": dict(config),
-        "sms_consent": sms_consent,
-        "callback_requested": bool(callback_requested),
-        "callback_due_at": callback_due_at,
-        "caller_name": caller_name,
-        "appointment_date": appointment_date,
-    })
-
-
-def get_pending_transfer_state(call_sid: str) -> dict[str, Any]:
-    prune_stale_pending_transfers()
-    pending = _pending_transfers.get(call_sid)
-    return dict(pending) if pending else {}
-
-
-def clear_pending_transfer(call_sid: str):
-    _pending_transfers.pop(call_sid, None)
-
-
-def prune_stale_pending_transfers(
-    *,
-    now: float | None = None,
-    ttl_seconds: int = PENDING_TRANSFER_TTL_SECONDS,
-) -> int:
-    """Drop old legacy transfer records that never received a terminal callback."""
-    current = time.time() if now is None else now
-    cutoff = current - max(0, ttl_seconds)
-    removed = 0
-    for pending_call_sid, pending in list(_pending_transfers.items()):
-        timestamp = pending.get("updated_at") or pending.get("created_at") or 0
-        try:
-            transfer_time = float(timestamp)
-        except (TypeError, ValueError):
-            transfer_time = 0
-        if transfer_time < cutoff:
-            _pending_transfers.pop(pending_call_sid, None)
-            removed += 1
-    if removed:
-        logger.info(f"Pruned {removed} stale pending transfer record(s)")
-    return removed
-
-
-def clear_pending_transfer_if_terminal(call_sid: str):
-    pending = _pending_transfers.get(call_sid)
-    if pending and pending.get("terminal_logged"):
-        clear_pending_transfer(call_sid)
-
-
 def mark_sms_consent(call_sid: str, consented: bool):
     """Record the caller's SMS consent decision."""
     if call_sid in _call_contexts:
@@ -364,6 +230,44 @@ def has_sms_consent(call_sid: str) -> bool | None:
     """Check SMS consent status. Returns None if not yet asked."""
     ctx = _call_contexts.get(call_sid, {})
     return ctx.get("sms_consent", None)
+
+
+_CALLER_NAME_PLACEHOLDERS = {
+    "unknown", "n/a", "na", "none", "caller", "customer", "client",
+    "anonymous", "no name", "not given", "test",
+}
+
+
+def _normalize_caller_name(name: Any) -> str:
+    """Return a usable caller name, or "" when there is not one.
+
+    D12 says no name, no lead — so this is the gate, and every caller of it
+    tests plain truthiness. The model will happily pass "unknown" or the
+    caller's phone number when it has not actually been told a name, and a lead
+    row named "Customer" is worse than no lead at all.
+    """
+    text = " ".join(str(name or "").split())
+    if not text or len(text) > 80:
+        return ""
+    if text.lower().strip(".") in _CALLER_NAME_PLACEHOLDERS:
+        return ""
+    if not any(char.isalpha() for char in text):
+        return ""
+    return text
+
+
+def mark_caller_name(call_sid: str, name: Any):
+    """Record the caller's name for the call log and lead capture."""
+    if call_sid in _call_contexts:
+        normalized = _normalize_caller_name(name)
+        if normalized:
+            _call_contexts[call_sid]["caller_name"] = normalized
+
+
+def get_caller_name(call_sid: str) -> str:
+    """Return the caller's name if one was given during this call."""
+    ctx = _call_contexts.get(call_sid, {})
+    return str(ctx.get("caller_name") or "")
 
 
 def _normalize_container_size(size: Any) -> str:
@@ -1009,8 +913,8 @@ def _assess_service_area(components: dict[str, str], config: dict[str, Any]) -> 
 
 # ── Tool Failure Counter (per call, per tool) ──────────
 # Tracks how many times a given tool has hit a SYSTEM error in this call.
-# Validation errors (bad date format, slot_full, etc.) do NOT count — those
-# are LLM-correctable. Only network/API/exception failures count.
+# Validation errors (a bad date format, a full calendar, etc.) do NOT count —
+# those are LLM-correctable. Only network/API/exception failures count.
 # After 2 failures of the same tool, the handler returns {"fallback": true}
 # which the prompt's HUMAN HANDOFF rule converts into an automatic transfer.
 
@@ -1093,6 +997,34 @@ def get_inflight_tasks(call_sid: str) -> list:
     return list(_call_contexts[call_sid].get("inflight_tasks", set()))
 
 
+async def handle_record_caller_name(params: FunctionCallParams):
+    """Record the caller's name once they give it.
+
+    Pure state, no network. The opening line asks who is calling precisely so a
+    caller who never books can still be recorded as a lead, and this is where
+    that answer is kept.
+    """
+    ctx = _get_context()
+    call_sid = ctx.get("call_sid", "")
+    name = _normalize_caller_name(params.arguments.get("name"))
+
+    if not name:
+        await params.result_callback({
+            "recorded": False,
+            "message": "That was not a usable name. Do not ask again unless it comes up naturally, and carry on helping.",
+        })
+        return
+
+    if call_sid:
+        mark_caller_name(call_sid, name)
+        logger.info(f"Caller name recorded for call {call_sid}")
+
+    await params.result_callback({
+        "recorded": True,
+        "message": f"Name recorded as {name}. Use it naturally, and do not ask for it again.",
+    })
+
+
 async def handle_record_sms_consent(params: FunctionCallParams):
     """Record the caller's verbal SMS consent decision.
 
@@ -1154,6 +1086,89 @@ def _ingest_headers(config: dict[str, Any]) -> dict[str, str]:
         "x-site-token": config.get("siteToken", ""),
     }
 
+
+
+# The three strings `bot.py` falls back to when the summariser fails or times
+# out. They are fine on a call log, but the lead's description renders verbatim
+# under "Customer's Message" in the operator's pipeline, so a lead ships with no
+# description rather than machine wording plus a raw transcript.
+_SUMMARY_FALLBACK_PREFIXES = (
+    "Summary unavailable",
+    "No caller conversation captured",
+    "AI summary unavailable",
+)
+
+
+def usable_inquiry(summary: str) -> str:
+    """Return the call summary if it is a real one, else ""."""
+    text = str(summary or "").strip()
+    if not text or text.startswith(_SUMMARY_FALLBACK_PREFIXES):
+        return ""
+    return text
+
+
+async def create_lead_from_call(
+    *,
+    config: dict[str, Any],
+    name: str,
+    phone: str,
+    description: str,
+    sms_consent: bool,
+) -> bool:
+    """Record a caller who did not book as a lead on the dashboard.
+
+    D12: no name, no lead — the caller has to have told us who they are.
+
+    Deliberately NOT sent: `serviceType` (a value of "dumpster_rental" makes the
+    dashboard auto-approve a container reservation, so the agent would silently
+    reserve a dumpster), and `notes` (the pipeline regex-splits that field into
+    chips, so a sentence arrives as fragments). The inquiry belongs in
+    `description`, which renders verbatim.
+
+    Never retried. `/api/ingest/lead` has no dedup on create, so a retry is a
+    second lead row, a second operator alert, and possibly a second text.
+    """
+    if not name or not phone:
+        return False
+
+    payload: dict[str, Any] = {
+        "name": name,
+        "phone": phone,
+        "source": "phone_ai",
+        "status": "new",
+    }
+    if description:
+        payload["description"] = description
+    if sms_consent:
+        payload["smsOptIn"] = True
+        payload["consentText"] = "Caller agreed on a recorded phone call to receive text messages."
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            resp = await http.post(
+                f"{DASHBOARD_URL}/api/ingest/lead",
+                json=payload,
+                headers=_ingest_headers(config),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+            if resp.status in (200, 201):
+                logger.info(f"Lead created from phone call for {config.get('companyName', 'unknown')}")
+                return True
+            if resp.status == 429:
+                # Per-IP hourly budget on the dashboard side, and the phone
+                # agent shares egress IPs across every tenant. Nothing retries,
+                # so this lead is gone — say so loudly enough to be noticed.
+                logger.error(
+                    "Lead POST rate-limited (429). This lead is LOST — the agent "
+                    "does not retry, because the route has no dedup on create."
+                )
+                return False
+            body = await _safe_json(resp, "ingest-lead-error")
+            logger.error(f"Lead POST failed: {resp.status} {body}")
+            return False
+    except Exception as e:
+        logger.error(f"Lead POST error: {e}")
+        return False
 
 
 async def _safe_json(resp: aiohttp.ClientResponse, label: str) -> dict:
@@ -1527,15 +1542,14 @@ async def handle_check_container_availability(params: FunctionCallParams):
                         data,
                     )
 
-                    # Round to nearest $5 for clean customer-facing prices
-                    def _round5(n: float) -> int:
-                        return round(n / 5) * 5
-
+                    # Speak the configured price. Rounding it to the nearest $5
+                    # read cleanly but quoted a number the customer is not
+                    # billed — the dashboard charges the configured amount.
                     price_msg = ""
                     if base_rate:
-                        price_msg = f"${_round5(base_rate)} for {included_days} days"
+                        price_msg = f"${base_rate:.0f} for {included_days} days"
                         if extended_rate:
-                            price_msg += f", then ${_round5(extended_rate)}/day after"
+                            price_msg += f", then ${extended_rate:.0f}/day after"
 
                     await params.result_callback({
                         "available": True,
@@ -1726,6 +1740,60 @@ async def handle_check_available_slots(params: FunctionCallParams):
         })
 
 
+# Reason codes no amount of date-shopping can fix. `no_trucks` means the
+# operator has no vehicles set up at all, and `material_not_accepted` means the
+# tip will not take it — both come back with an empty `alternatives` list, so
+# offering another day would be a lie dressed up as helpfulness.
+_UNFIXABLE_BY_DATE = {"no_trucks", "material_not_accepted"}
+
+# Two capacity refusals per call, then stop. Every POST to /api/agent/book
+# creates another Lead row dashboard-side, so an unbounded date-shopping loop
+# quietly fills the operator's pipeline with duplicates of one caller.
+_CAPACITY_REFUSAL_LIMIT = 2
+
+
+def _build_capacity_refusal(call_sid: str, data: dict[str, Any], spoken_date: str) -> dict[str, Any]:
+    """Turn the dashboard's deliberate "not that day" into something sayable.
+
+    Deliberately does NOT share the `create_booking` failure counter. That one
+    escalates with "I'm having repeated trouble with this", which is false here
+    — nothing is broken, the day is just full — and it would let one real
+    outage plus one full day trip a handoff.
+    """
+    feasibility = data.get("feasibility") or {}
+    reason = str(feasibility.get("reasonCode") or "")
+    alternatives = [a for a in (data.get("alternatives") or []) if a.get("date")]
+    attempts = increment_tool_failure(call_sid, "create_booking_capacity") if call_sid else 1
+
+    if reason == "no_trucks":
+        return {
+            "error": "no_crew_configured",
+            "message": "This operator has no crew set up for bookings, so no date will work. Do not offer another day. Tell the caller you cannot get it booked from here and that someone from the team will call them straight back, then follow HUMAN HANDOFF.",
+        }
+
+    if reason == "material_not_accepted":
+        return {
+            "error": "material_not_accepted",
+            "message": "The tip will not take what this caller described, so changing the date fixes nothing. Do not offer another day and do not guess at what is acceptable. Say you do not want to promise a day you cannot keep, and that someone from the team will sort out where it can go. Then follow HUMAN HANDOFF.",
+        }
+
+    if attempts >= _CAPACITY_REFUSAL_LIMIT or not alternatives:
+        return {
+            "error": "no_dates_available",
+            "message": f"Nothing is open near {spoken_date}. Do not offer any more dates and do not ask the caller for another one — you have already tried. Tell them you cannot find anything in the next week or so and that someone from the team will call to sort it out, then follow HUMAN HANDOFF.",
+        }
+
+    spoken = [_format_spoken_date(a["date"]) for a in alternatives[:2]]
+    # These are other DAYS, never other times on the same day — the dashboard
+    # probes forward from tomorrow and keeps the caller's original time window.
+    offer = spoken[0] if len(spoken) == 1 else f"{spoken[0]}, or {spoken[1]}"
+    return {
+        "error": "date_unavailable",
+        "alternatives": [a["date"] for a in alternatives[:2]],
+        "message": f"{spoken_date} is full. Offer these instead, as days rather than times: {offer}. Say it briefly — the caller already told you what day they wanted, so do not ask 'what day works for you' again. If they pick one, call create_booking with it.",
+    }
+
+
 async def handle_create_booking(params: FunctionCallParams):
     """Create a booking via dashboard's /api/agent/book.
 
@@ -1843,7 +1911,19 @@ async def handle_create_booking(params: FunctionCallParams):
     # ── Build notes ──
     if is_swap:
         size_str = f"{container_size}-yard" if container_size else "current size"
-        notes = f"Dumpster Swap: pick up full {size_str} container, drop off empty. {description}"
+        # A final pickup is booked as a swap because the dashboard has no
+        # pickup-only type, and the prompt says so in the description. The note
+        # the crew reads must not then promise a replacement container the
+        # caller explicitly turned down.
+        lowered = str(description or "").lower()
+        pickup_only = any(
+            phrase in lowered
+            for phrase in ("pickup-only", "pickup only", "pick up only", "no replacement", "final pickup")
+        )
+        if pickup_only:
+            notes = f"FINAL PICKUP — collect the {size_str} container, do NOT drop off a replacement. {description}"
+        else:
+            notes = f"Dumpster Swap: pick up full {size_str} container, drop off empty. {description}"
     elif is_dumpster:
         size_str = f"{container_size}-yard" if container_size else "TBD size"
         safe_description = _dashboard_safe_duration_notes(description)
@@ -1918,6 +1998,7 @@ async def handle_create_booking(params: FunctionCallParams):
                             "appointment_date": local_datetime,
                         })
                         reset_tool_failure(call_sid, "create_booking")
+                        reset_tool_failure(call_sid, "create_booking_capacity")
 
                     data = await _safe_json(resp, "create-booking")
                     job_id = data.get("jobId", "confirmed")
@@ -1925,12 +2006,30 @@ async def handle_create_booking(params: FunctionCallParams):
                     logger.info(f"{label} created: jobId={job_id} for {name} on {date} ({slot['period']} window)")
 
                     auto_booked = data.get("autoBooked", False)
+                    # The dashboard branches its own SMS copy on `scheduled`, so
+                    # branching on the same field keeps the voice and the text
+                    # saying the same thing by construction. They move together
+                    # for swaps; `autoBooked` is the fallback for older shapes.
+                    scheduled = data.get("scheduled", auto_booked)
 
-                    if is_swap:
+                    if is_swap and scheduled:
+                        # No text is sent for a scheduled swap — by design, the
+                        # voice is the only confirmation the customer gets.
                         result = {
                             "success": True,
+                            "scheduled": True,
                             "booking_id": str(job_id),
-                            "message": f"Dumpster swap scheduled for {spoken_date}, {spoken_slot}. We'll pick up the full container and drop off an empty one.",
+                            "message": f"Swap confirmed for {spoken_date}, {spoken_slot}. Tell the caller we'll be out then. No confirmation text goes out for a booked swap, so what you say now is the only confirmation they get.",
+                        }
+                    elif is_swap:
+                        # A container has not been matched yet. The dashboard
+                        # texts "your swap request is in", so the voice must not
+                        # claim it is scheduled.
+                        result = {
+                            "success": True,
+                            "scheduled": False,
+                            "booking_id": str(job_id),
+                            "message": f"Swap request logged for {spoken_date}, but no container has been assigned yet. Do NOT tell the caller it is scheduled or give them a time. Say the request is in and the team will confirm the exact time with them. They will also get a text confirming we have it.",
                         }
                     elif is_dumpster and auto_booked:
                         size_label = f"{container_size}-yard" if container_size else ""
@@ -1954,30 +2053,26 @@ async def handle_create_booking(params: FunctionCallParams):
                             "booking_id": str(job_id),
                             "message": f"Booking confirmed for {spoken_date}, {spoken_slot}.",
                         }
-                elif resp.status == 409:
-                    # slot_full — the time slot filled between checking and booking
-                    data = await _safe_json(resp, "create-booking-conflict")
-                    available_slots = data.get("availableSlots", [])
-                    if available_slots:
-                        avail = [s for s in available_slots if s.get("available")]
-                        if avail:
-                            alt_strs = [f"{_format_spoken_time(s['start'])} to {_format_spoken_time(s['end'])}" for s in avail[:4]]
-                            result = {
-                                "error": "slot_full",
-                                "message": f"That time slot just filled up. Available alternatives: {', '.join(alt_strs)}. Ask the caller which works.",
-                                "availableSlots": avail,
-                            }
-                        else:
-                            result = {
-                                "error": "slot_full",
-                                "message": f"That time slot and all others on {spoken_date} are now full. Suggest a different date.",
-                                "availableSlots": [],
-                            }
+                elif resp.status == 200:
+                    # 201 books; a 200 is the dashboard declining the date on
+                    # purpose. It is NOT an error — the old code sent it down the
+                    # generic path, so the caller heard "trouble with our
+                    # scheduling system" and the alternative dates were binned.
+                    #
+                    # Gate on the `success` field, never the status: a proxy or
+                    # auth wall also answers 200, and `_safe_json` turns that
+                    # body into {"error": ...}, so `success` is None and it
+                    # correctly falls through to the error path below.
+                    data = await _safe_json(resp, "create-booking-refused")
+                    if data.get("success") is False:
+                        result = _build_capacity_refusal(call_sid, data, spoken_date)
                     else:
-                        result = {
-                            "error": "slot_full",
-                            "message": "That time slot just filled up. Ask the caller for a different time.",
-                        }
+                        logger.error(f"Booking API returned 200 without success:false: {data}")
+                        result = _build_error_with_tracking(
+                            call_sid,
+                            "create_booking",
+                            "I'm having trouble with our scheduling system. Let me take your info and have someone call you back.",
+                        )
                 else:
                     text = await resp.text()
                     logger.error(f"Booking API error: {resp.status} {text}")
@@ -2085,10 +2180,13 @@ async def handle_lookup_appointment(params: FunctionCallParams):
                             "error": "identity_verification_failed",
                             "message": (
                                 "This caller already failed to confirm this booking on "
-                                "this call. Do not ask again, do not reveal any detail "
-                                "of it, and do not offer a callback. Tell them you'll "
-                                "put them through to someone who can help, and call "
-                                "transfer_to_human now."
+                                "this call. Do not ask again and do not reveal any detail "
+                                "of it — not the name, address, date, price, or whether "
+                                "it exists. Say you cannot pull it up from this number "
+                                "and that you will get someone onto it, then call "
+                                "transfer_to_human now. If it records a callback instead "
+                                "of connecting, that is fine: say someone will ring them "
+                                "back on this number, and still reveal nothing."
                             ),
                         })
                         return
@@ -2121,7 +2219,7 @@ async def handle_lookup_appointment(params: FunctionCallParams):
                 await params.result_callback(_build_error_with_tracking(
                     ctx.get("call_sid", ""),
                     "lookup_appointment",
-                    "I'm having trouble looking that up. Can you give me your name instead?",
+                    "Lookup failed. Ask for a name only if the caller has not already given one this call, then try again.",
                 ))
     except Exception as e:
         logger.error(f"Appointment lookup failed: {e}")
@@ -2139,9 +2237,12 @@ async def handle_verify_caller_identity(params: FunctionCallParams):
     one on it. The caller must state the service address; it is compared against
     the record held server-side by `handle_lookup_appointment`.
 
-    On failure the caller is handed to a human — deliberately not offered a
-    callback, because a callback would still be an unverified caller directing
-    where the business rings back to.
+    On failure the caller is handed to a human. After hours that handoff records
+    a callback instead (D26), which is safe here: the callback number is the
+    Twilio `From` for the call (`server.py` reads it from the stream's
+    customParameters), never a number the caller supplied — so an unverified
+    caller cannot steer where the business rings back to. What must not leak is
+    any detail of the booking, and the returned instruction says so either way.
     """
     ctx = _get_context()
     call_sid = ctx.get("call_sid", "")
@@ -2181,9 +2282,11 @@ async def handle_verify_caller_identity(params: FunctionCallParams):
             "error": "identity_verification_failed",
             "message": (
                 "That does not match the address on the booking. Do not reveal any "
-                "detail of it, do not offer another attempt, and do not offer a "
-                "callback. Tell the caller you'll put them through to someone who "
-                "can help, and call transfer_to_human now."
+                "detail of it and do not offer another attempt. Say you cannot pull it "
+                "up from this number and that you will get someone onto it, then call "
+                "transfer_to_human now. If it records a callback instead of connecting, "
+                "that is fine: say someone will ring them back on this number, and "
+                "still reveal nothing."
             ),
         })
         return
@@ -2426,7 +2529,7 @@ async def handle_verify_address(params: FunctionCallParams):
                     await params.result_callback({
                         "verified": False,
                         "error": "postal_code_missing",
-                        "message": "I found the address, but not a ZIP code. Ask the caller to confirm the city and ZIP code before booking."
+                        "message": "The address resolved but with no ZIP. Read back what you have and ask only for the ZIP — do not ask for the whole address again."
                     })
                     return
 
@@ -2516,6 +2619,10 @@ _twilio_client = None
 
 
 def _get_twilio_client():
+    # No production caller. Kept deliberately: test_dashboard_transfer patches
+    # this to assert the AI never updates Twilio directly, which is the
+    # regression guard for the subaccount bug that made dashboard-owned
+    # transfers necessary in the first place. Deleting it would delete the guard.
     """Get or create Twilio REST client for call operations."""
     global _twilio_client
     if _twilio_client is None:
@@ -2551,12 +2658,29 @@ async def handle_schedule_callback(params: FunctionCallParams):
         or ""
     )
     caller_phone = str(caller_phone).strip()
+    # Same guard create_booking uses: the model can pass a phrase like "the
+    # number you're calling from" instead of digits. The dashboard rejects that
+    # with a 400 that used to be reported to the caller as a bad TIME.
+    if not re.search(r"\d{7,}", re.sub(r"[\s\-\(\)\+]", "", caller_phone)):
+        fallback_phone = ctx.get("caller_number", "")
+        if fallback_phone:
+            logger.info(
+                f"Replaced callback phone '{caller_phone}' with caller_number "
+                f"'{fallback_phone}'"
+            )
+            caller_phone = fallback_phone
     caller_name = (
         params.arguments.get("caller_name")
         or params.arguments.get("callerName")
         or ""
     )
     caller_name = str(caller_name).strip()
+    # This is the one non-booking path that is already handed the caller's name,
+    # and it used to keep it only for the outgoing payload. Recording it here
+    # means a caller who asks for a callback and nothing else is still named on
+    # the call log.
+    if call_sid and caller_name:
+        mark_caller_name(call_sid, caller_name)
 
     async def _deliver_result(result: dict[str, Any]):
         try:
@@ -2581,7 +2705,7 @@ async def handle_schedule_callback(params: FunctionCallParams):
     if not caller_phone:
         await _deliver_result({
             "error": "caller_phone_required",
-            "message": "Confirm the best phone number for the callback, then try again.",
+            "message": "No usable callback number. If the caller already confirmed a number earlier in this call, use that one — only ask again if none was confirmed.",
         })
         return
 
@@ -2609,6 +2733,7 @@ async def handle_schedule_callback(params: FunctionCallParams):
                     if call_sid:
                         mark_callback_requested(call_sid, requested_time, reason)
                         reset_tool_failure(call_sid, "schedule_callback")
+                        reset_tool_failure(call_sid, "callback_time")
 
                     data = await _safe_json(resp, "schedule-callback")
                     callback_due_at = data.get("callbackDueAt") or requested_time
@@ -2625,7 +2750,49 @@ async def handle_schedule_callback(params: FunctionCallParams):
                     return
 
                 data = await _safe_json(resp, "schedule-callback-error")
-                if resp.status in (400, 422):
+                error_text = str(data.get("error") or "")
+
+                # 400 is about the PHONE, 422 is about the TIME. Collapsing them
+                # told a caller with an unusable number that their time was
+                # unavailable, and they would offer time after time.
+                if resp.status == 400:
+                    await _deliver_result({
+                        "error": "invalid_callback_phone",
+                        "message": "That phone number was not usable. Confirm the best number to reach them on, read it back, and try again. Do not ask for a different time.",
+                    })
+                    return
+
+                if resp.status == 403:
+                    # Tenant mismatch. Not retryable, and it must not return a
+                    # fallback: after hours the mandated transfer is refused.
+                    logger.error(f"Schedule callback rejected as cross-tenant: {data}")
+                    await _deliver_result({
+                        "error": "callback_not_available",
+                        "message": "A callback cannot be booked on this call. Apologise briefly, do not try again, and carry on helping with anything else.",
+                    })
+                    return
+
+                if resp.status == 422:
+                    # Four shapes, and one of them cannot be recovered by
+                    # offering a different time: hours the operator has
+                    # misconfigured. "Outside business hours" USUALLY just means
+                    # the caller picked a bad slot — but it is also what an
+                    # all-closed schedule returns for every candidate date, and
+                    # the two are indistinguishable from the response. So the
+                    # first are treated as retryable and a repeat is not, which
+                    # stops the caller being asked for time after time.
+                    unusable_hours = "not configured correctly" in error_text
+                    attempts = increment_tool_failure(call_sid, "callback_time") if call_sid else 1
+                    if unusable_hours or attempts >= 2:
+                        logger.warning(
+                            f"Callback hours unusable for this client after "
+                            f"{attempts} attempt(s): {error_text}"
+                        )
+                        await _deliver_result({
+                            "error": "callback_hours_unavailable",
+                            "message": "A callback cannot be scheduled for this business right now. Tell the caller you have noted their request and someone will get back to them, then move on. Do not ask for another time.",
+                        })
+                        return
                     await _deliver_result({
                         "error": "invalid_callback_time",
                         "message": "That callback time is not available. Ask the caller for another time during business hours.",
@@ -2678,6 +2845,41 @@ async def handle_transfer_to_human(params: FunctionCallParams):
     ctx = _get_context()
     reason = params.arguments.get("reason", "Caller requested human agent")
     call_sid = ctx.get("call_sid")
+
+    # D21: outside business hours there is nobody to transfer to, so no handoff
+    # is attempted at all. The call is noted in the dashboard's Callback Queue
+    # and continues normally — no dashboard redirect, no pipeline cancel.
+    #
+    # This sits ABOVE the "requested" write below. If the caller hangs up
+    # between the two, that write would stand on its own and the call would be
+    # logged as a transfer that never happened.
+    #
+    # The result deliberately carries no "fallback": true. Several prompt sites
+    # mandate a transfer on any fallback, so returning one here would send the
+    # model straight back into the tool it was just refused by.
+    if not evaluate_current_business_hours(config):
+        if call_sid:
+            mark_transfer_state(
+                call_sid, "suppressed_after_hours", reason, callback_requested=True
+            )
+        logger.info(
+            f"Transfer suppressed outside business hours for call {call_sid} "
+            f"(reason: {reason}); caller added to the callback queue"
+        )
+        await params.result_callback({
+            "transferred": False,
+            "after_hours": True,
+            "say": "The office is closed right now, but I've left a note for the team and someone will give you a call back on this number.",
+            "note": (
+                "AFTER HOURS. No transfer was attempted and none is possible; the "
+                "caller is already on the callback queue. Say the line above in your "
+                "own words. It is normal, not a fault, so do not apologise for a "
+                "problem and do not try to transfer again on this call. Then carry on "
+                "— you can still book, look up, reschedule and cancel."
+            ),
+        })
+        return
+
     if call_sid:
         mark_transfer_state(call_sid, "requested", reason)
 
@@ -2722,12 +2924,11 @@ async def handle_transfer_to_human(params: FunctionCallParams):
                 DASHBOARD_ORIGIN_AI_TRANSFER,
                 reason=str(reason),
             )
-            clear_pending_transfer(ctx["call_sid"])
 
         await params.result_callback({
             "transferred": True,
             "transferStatus": "dashboard_redirected",
-            "message": "Transferring the call now.",
+            "note": "The transfer is going through. Say nothing further — the line hands over immediately.",
         })
 
         # Cancel the AI pipeline — the call audio stream will end
@@ -2740,10 +2941,10 @@ async def handle_transfer_to_human(params: FunctionCallParams):
         logger.error(f"Transfer failed for call {call_sid}: {e}")
         if call_sid:
             mark_transfer_state(call_sid, "failed", reason, callback_requested=True)
-            _update_pending_transfer_status(call_sid, "failed", callback_requested=True)
         await params.result_callback({
             "transferred": False,
-            "message": "I'm having trouble with the transfer right now. Let me take your info and have someone call you back within the hour.",
+            "say": "I couldn't get anyone on the line just now, but I've put a note in and someone from the team will get back to you.",
+            "note": "The transfer did not connect. The caller is on the callback queue. Do not promise a time and do not try again.",
         })
 
 
@@ -2754,305 +2955,14 @@ async def handle_transfer_to_human(params: FunctionCallParams):
 # sends are handled by dashboard/post-call paths.
 
 # Fixed SMS templates — LLM picks a template name and supplies variables.
-_SMS_TEMPLATES: dict[str, str] = {
-    "follow_up": (
-        "{company_name}: Thanks for calling! Whenever you're ready, you can "
-        "get a free estimate and book online in under 2 minutes — no phone "
-        "call needed 👇\n\n"
-        "{website_url}?utm_source=phone_agent&utm_medium=sms&utm_campaign=followup\n\n"
-        "Or call us back anytime at {company_phone} — we're here "
-        "{days_str}, {hours_str}."
-    ),
-}
-
-
-def _build_sms_body(template_name: str, config: dict[str, Any]) -> str | None:
-    """Render an SMS template with config values. Returns None for unknown templates."""
-    template = _SMS_TEMPLATES.get(template_name)
-    if not template:
-        return None
-
-    company_name = config.get("companyName", "Junk Removal")
-    website_url = config.get("websiteUrl", "")
-    # Use forwardingPhone as company phone; fall back to twilioNumber
-    company_phone = config.get("forwardingPhone") or config.get("twilioNumber", "")
-
-    # Build business hours string
-    business_start = int(config.get("businessStart", 7))
-    business_end = int(config.get("businessEnd", 19))
-    business_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
-    day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-    active_days = [day_names[d] for d in business_days if 0 <= d <= 6]
-    days_str = (
-        f"{active_days[0]} through {active_days[-1]}"
-        if len(active_days) > 1
-        else active_days[0] if active_days else "Monday through Saturday"
-    )
-
-    def fmt_hour(h: int) -> str:
-        if h == 0:
-            return "12 AM"
-        elif h < 12:
-            return f"{h} AM"
-        elif h == 12:
-            return "12 PM"
-        else:
-            return f"{h - 12} PM"
-
-    hours_str = f"{fmt_hour(business_start)} to {fmt_hour(business_end)}"
-
-    return template.format(
-        company_name=company_name,
-        website_url=website_url,
-        company_phone=company_phone,
-        days_str=days_str,
-        hours_str=hours_str,
-    )
-
-
-async def handle_send_sms(params: FunctionCallParams):
-    """Send a fixed-template SMS to the caller via Twilio.
-
-    Triple-gated: smsEnabled must be true, twilioNumber must exist,
-    and caller_number (or explicit phone arg) must be available.
-
-    Uses the platform's Twilio credentials but sends FROM the client's
-    provisioned phone number so the SMS appears to come from them.
-    """
-    config = _get_config()
-    ctx = _get_context()
-    template_name = params.arguments.get("template", "")
-    explicit_phone = params.arguments.get("phone", "")
-
-    # ── Gate 0: SMS consent ──
-    call_sid = ctx.get("call_sid", "")
-    consent = has_sms_consent(call_sid) if call_sid else None
-    if consent is not True:
-        logger.info(f"SMS blocked: no consent for call {call_sid} (consent={consent})")
-        await params.result_callback({
-            "sent": False,
-            "message": "I can give you the details verbally instead.",
-        })
-        return
-
-    # ── Gate 1: smsEnabled ──
-    if not config.get("smsEnabled", False):
-        logger.info("SMS disabled for this client — skipping send_sms")
-        await params.result_callback({
-            "sent": False,
-            "message": "I'm not able to send texts right now, but I can give you the details verbally.",
-        })
-        return
-
-    # ── Gate 2: twilioNumber (from= number) ──
-    twilio_number = config.get("twilioNumber")
-    if not twilio_number:
-        logger.warning("No twilioNumber configured — cannot send SMS")
-        await params.result_callback({
-            "sent": False,
-            "message": "I'm not able to send texts right now, but let me give you the information.",
-        })
-        return
-
-    # ── Gate 3: recipient number ──
-    to_number = explicit_phone or ctx.get("caller_number", "")
-    if not to_number:
-        logger.warning("No recipient phone number — cannot send SMS")
-        await params.result_callback({
-            "sent": False,
-            "message": "I don't have a number to text. What's the best number to reach you at?",
-        })
-        return
-
-    # ── Gate 4: websiteUrl required for both templates ──
-    website_url = config.get("websiteUrl")
-    if not website_url:
-        logger.info("No websiteUrl configured — cannot send website link SMS")
-        await params.result_callback({
-            "sent": False,
-            "message": "I'm not able to send a link right now, but you can search for us online to find our website.",
-        })
-        return
-
-    # ── Build message from template ──
-    body = _build_sms_body(template_name, config)
-    if not body:
-        logger.error(f"Unknown SMS template: {template_name}")
-        await params.result_callback({
-            "sent": False,
-            "message": "I had trouble sending that text. Let me give you the information verbally instead.",
-        })
-        return
-
-    # ── Send via dashboard SMS endpoint (enforces A2P, consent, suppression gates) ──
-    try:
-        normalized_to = to_number if to_number.startswith("+") else f"+1{to_number.replace('-', '').replace(' ', '')}"
-        async with aiohttp.ClientSession() as http:
-            resp = await http.post(
-                f"{DASHBOARD_URL}/api/agent/sms/send",
-                json={
-                    "clientId": config.get("clientId", ""),
-                    "to": normalized_to,
-                    "message": body,
-                    "consentGranted": True,
-                    "consentSource": "phone_agent",
-                },
-                headers=_agent_headers(config),
-                timeout=aiohttp.ClientTimeout(total=15),
-            )
-            data = await _safe_json(resp, "agent-sms-send")
-
-        if data.get("success"):
-            logger.info(f"SMS sent via dashboard: template={template_name} to={to_number} sid={data.get('sid', 'n/a')}")
-
-            # Track that SMS was sent during this call
-            ctx = _get_context()
-            if ctx.get("call_sid"):
-                mark_sms_sent(ctx["call_sid"])
-
-            await params.result_callback({
-                "sent": True,
-                "message": "Text message sent successfully.",
-            })
-        else:
-            error = data.get("error", "unknown")
-            logger.info(f"SMS blocked by dashboard: {error} (template={template_name} to={to_number})")
-            await params.result_callback({
-                "sent": False,
-                "message": "I'm not able to send texts right now, but I can give you the details verbally.",
-            })
-
-    except Exception as e:
-        logger.error(f"SMS send via dashboard failed: {e}")
-        await params.result_callback({
-            "sent": False,
-            "message": "I had trouble sending that text, but no worries — let me give you the details.",
-        })
 
 
 # ── Automated Follow-Up SMS (called from bot.py after call ends) ──
 
 # 24-hour cooldown — keyed by normalized phone number
-_sms_cooldown: dict[str, datetime] = {}
-SMS_COOLDOWN_HOURS = 24
-
-
-def _normalize_phone(phone: str) -> str:
-    """Strip a phone to digits only for consistent cooldown keying."""
-    return "".join(c for c in phone if c.isdigit())
-
-
-async def send_automated_followup(caller_number: str, config: dict[str, Any], sms_consented: bool = False) -> bool:
-    """Send an automated follow-up SMS after a no-booking call.
-
-    Called from bot.py on disconnect, NOT from an LLM tool handler.
-    Returns True if sent, False otherwise.
-    """
-    # Gate: explicit consent required
-    if not sms_consented:
-        logger.info(f"Automated follow-up skipped: no SMS consent for {caller_number}")
-        return False
-
-    # Gate checks
-    if not config.get("smsEnabled", False):
-        logger.debug("Automated follow-up skipped: SMS disabled")
-        return False
-    twilio_number = config.get("twilioNumber")
-    if not twilio_number:
-        logger.debug("Automated follow-up skipped: no twilioNumber")
-        return False
-    if not config.get("websiteUrl"):
-        logger.debug("Automated follow-up skipped: no websiteUrl")
-        return False
-    if not caller_number:
-        logger.debug("Automated follow-up skipped: no caller number")
-        return False
-
-    # ── Prune expired cooldown entries ──
-    cutoff = datetime.now() - timedelta(hours=SMS_COOLDOWN_HOURS)
-    expired_keys = [k for k, v in _sms_cooldown.items() if v < cutoff]
-    for k in expired_keys:
-        del _sms_cooldown[k]
-
-    # ── 24-hour cooldown check ──
-    key = _normalize_phone(caller_number)
-    last_sent = _sms_cooldown.get(key)
-    if last_sent and (datetime.now() - last_sent) < timedelta(hours=SMS_COOLDOWN_HOURS):
-        logger.info(f"Automated follow-up skipped: SMS already sent to {caller_number} within {SMS_COOLDOWN_HOURS}h")
-        return False
-
-    body = _build_sms_body("follow_up", config)
-    if not body:
-        return False
-
-    try:
-        normalized_to = caller_number if caller_number.startswith("+") else f"+1{caller_number.replace('-', '').replace(' ', '')}"
-        async with aiohttp.ClientSession() as http:
-            resp = await http.post(
-                f"{DASHBOARD_URL}/api/agent/sms/send",
-                json={
-                    "clientId": config.get("clientId", ""),
-                    "to": normalized_to,
-                    "message": body,
-                    "consentGranted": True,
-                    "consentSource": "phone_agent",
-                },
-                headers=_agent_headers(config),
-                timeout=aiohttp.ClientTimeout(total=15),
-            )
-            data = await _safe_json(resp, "agent-sms-followup")
-
-        if data.get("success"):
-            logger.info(f"Automated follow-up SMS sent via dashboard: to={caller_number} sid={data.get('sid', 'n/a')}")
-            _sms_cooldown[key] = datetime.now()
-            return True
-        else:
-            error = data.get("error", "unknown")
-            logger.info(f"Automated follow-up SMS blocked by dashboard: {error} (to={caller_number})")
-            return False
-    except Exception as e:
-        logger.error(f"Automated follow-up SMS failed: {e}")
-        return False
 
 
 # ── Dashboard Logging Helpers ──────────────────────────────────
-
-async def _log_sms_to_dashboard(
-    config: dict[str, Any],
-    to_number: str,
-    from_number: str,
-    template_name: str,
-    sms_type: str,
-    twilio_call_sid: str = "",
-    twilio_sms_sid: str = "",
-) -> None:
-    """Fire-and-forget POST to dashboard SMS log endpoint."""
-    try:
-        payload = {
-            "toNumber": to_number,
-            "fromNumber": from_number,
-            "templateName": template_name,
-            "type": sms_type,
-        }
-        if twilio_call_sid:
-            payload["twilioCallSid"] = twilio_call_sid
-        if twilio_sms_sid:
-            payload["twilioSmsSid"] = twilio_sms_sid
-
-        async with aiohttp.ClientSession() as http:
-            resp = await http.post(
-                f"{DASHBOARD_URL}/api/agent/sms-log",
-                json=payload,
-                headers=_agent_headers(config),
-                timeout=aiohttp.ClientTimeout(total=10),
-            )
-            if resp.status == 201:
-                logger.debug(f"SMS log recorded for {to_number}")
-            else:
-                body = await resp.text()
-                logger.warning(f"SMS log failed ({resp.status}): {body[:200]}")
-    except Exception as e:
-        logger.error(f"SMS log POST error: {e}")
 
 
 async def log_call_to_dashboard(
@@ -3116,283 +3026,3 @@ async def log_call_to_dashboard(
     except Exception as e:
         logger.error(f"Call log POST error: {e}")
         return False
-
-
-def _parse_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _callback_value(callback_data: dict[str, Any] | None, *keys: str) -> str:
-    if not callback_data:
-        return ""
-    for key in keys:
-        value = callback_data.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return ""
-
-
-def _transfer_reason_label(reason: str | None) -> str:
-    token = sanitize_transfer_reason_token(reason)
-    if not token:
-        return ""
-    label = _TRANSFER_REASON_LABELS[token]
-    return re.sub(r"[\r\n\t]+", " ", label).strip()[:200]
-
-
-def _coverage_transfer_summary(reason: str | None, label: str) -> str:
-    token = str(reason or "").strip()
-    if token not in _TRANSFER_REASON_LABELS:
-        return ""
-    return f"Call was routed to handoff because {label}."
-
-
-async def _fetch_twilio_call_snapshot(call_sid: str) -> dict[str, Any]:
-    if not call_sid:
-        return {}
-    try:
-        client = _get_twilio_client()
-        call = await asyncio.to_thread(client.calls(call_sid).fetch)
-        return {
-            "from_number": str(getattr(call, "from_", "") or ""),
-            "to_number": str(getattr(call, "to", "") or ""),
-            "duration": _parse_int(getattr(call, "duration", 0), 0),
-        }
-    except Exception as e:
-        logger.warning(f"Could not fetch Twilio call snapshot for {call_sid}: {e}")
-        return {}
-
-
-async def _recover_pending_transfer(
-    *,
-    client_id: str | None,
-    call_sid: str,
-    callback_data: dict[str, Any] | None,
-    dial_duration: str | int | None,
-    transfer_reason: str | None = None,
-) -> dict[str, Any] | None:
-    """Recover enough transfer state to log a terminal Dial callback after restart."""
-    if not client_id:
-        return None
-    try:
-        config = await get_client_config(client_id)
-    except Exception as e:
-        logger.error(f"Could not recover config for transfer callback client={client_id}: {e}")
-        return None
-
-    snapshot = await _fetch_twilio_call_snapshot(call_sid)
-    from_number = (
-        _callback_value(callback_data, "From", "Caller")
-        or snapshot.get("from_number")
-        or "unknown"
-    )
-    to_number = (
-        _callback_value(callback_data, "To", "Called")
-        or snapshot.get("to_number")
-        or config.get("twilioNumber", "")
-    )
-    duration = max(_parse_int(snapshot.get("duration"), 0), _parse_int(dial_duration, 0))
-    reason = _transfer_reason_label(transfer_reason) or "Caller requested human handoff"
-    return {
-        "config": config,
-        "from_number": from_number,
-        "to_number": to_number,
-        "reason": reason,
-        "transfer_status": "requested",
-        "duration": duration,
-        "summary": _coverage_transfer_summary(transfer_reason, reason),
-        "sms_consent": None,
-        "callback_requested": False,
-        "callback_due_at": None,
-        "caller_name": None,
-        "appointment_date": None,
-        "recovered": True,
-    }
-
-
-async def _log_interim_transfer_requested(
-    *,
-    call_sid: str,
-    config: dict[str, Any],
-    from_number: str,
-    reason: str,
-):
-    terminal = get_terminal_transfer_state(call_sid)
-    if terminal.get("transfer_status") in _TRANSFER_TERMINAL_STATUSES:
-        logger.info(f"Skipping interim transfer log for {call_sid}; terminal status already recorded")
-        return
-    try:
-        await asyncio.wait_for(
-            log_call_to_dashboard(
-                config=config,
-                twilio_call_sid=call_sid,
-                from_number=from_number or "unknown",
-                to_number=config.get("twilioNumber", ""),
-                duration=0,
-                outcome="transferred",
-                summary=f"Caller requested human handoff ({reason}); transfer dialing.",
-                transfer_reason=reason,
-                transfer_status="dialing",
-                callback_requested=False,
-            ),
-            timeout=3,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(f"Timed out writing interim transfer log for {call_sid}")
-
-
-async def process_transfer_status_callback(
-    client_id: str | None,
-    call_sid: str,
-    dial_status: str,
-    dial_call_sid: str = "",
-    dial_duration: str | int | None = None,
-    callback_data: dict[str, Any] | None = None,
-    transfer_reason: str | None = None,
-) -> str:
-    """Handle Twilio <Dial action> status and update the dashboard call log."""
-    status = (dial_status or "").strip().lower()
-    pending = _pending_transfers.get(call_sid)
-
-    if status in _TRANSFER_SUCCESS_STATUSES:
-        transfer_status = "completed"
-        outcome = "transferred"
-        callback_requested = False
-    elif status in _TRANSFER_FAILURE_STATUSES:
-        transfer_status = "failed"
-        outcome = "callback_requested"
-        callback_requested = True
-    else:
-        transfer_status = "failed"
-        outcome = "callback_requested"
-        callback_requested = True
-        logger.warning(f"Unknown DialCallStatus for {call_sid}: {dial_status!r}")
-
-    if call_sid in _call_contexts:
-        mark_transfer_state(
-            call_sid,
-            transfer_status,
-            pending.get("reason") if pending else _transfer_reason_label(transfer_reason) or None,
-            callback_requested=callback_requested,
-        )
-        if transfer_status == "completed":
-            mark_transfer_complete(call_sid)
-
-    _update_pending_transfer_status(
-        call_sid,
-        transfer_status,
-        callback_requested=callback_requested,
-    )
-
-    if not pending:
-        logger.warning(f"Transfer status callback received without pending context for {call_sid}")
-        pending = await _recover_pending_transfer(
-            client_id=client_id,
-            call_sid=call_sid,
-            callback_data=callback_data,
-            dial_duration=dial_duration,
-            transfer_reason=transfer_reason,
-        )
-        if not pending:
-            remember_terminal_transfer_state(
-                call_sid,
-                transfer_status,
-                callback_requested=callback_requested,
-            )
-            if callback_requested:
-                return (
-                    '<Response><Say voice="Polly.Joanna">'
-                    "We were not able to reach anyone right now. Please try again later. Goodbye."
-                    "</Say><Hangup/></Response>"
-                )
-            return "<Response><Hangup/></Response>"
-
-    if callback_requested:
-        remember_terminal_transfer_state(
-            call_sid,
-            transfer_status,
-            reason=pending.get("reason"),
-            callback_requested=True,
-        )
-    else:
-        remember_terminal_transfer_state(
-            call_sid,
-            transfer_status,
-            reason=pending.get("reason"),
-            callback_requested=False,
-        )
-
-    if not pending.get("config"):
-        logger.warning(f"Transfer status callback for {call_sid} has no dashboard config; skipping log")
-        if callback_requested:
-            return (
-                '<Response><Say voice="Polly.Joanna">'
-                "We were not able to reach anyone right now. Please try again later. Goodbye."
-                "</Say><Hangup/></Response>"
-            )
-        return "<Response><Hangup/></Response>"
-
-    base_duration = _parse_int(pending.get("duration"), 0)
-    dial_seconds = _parse_int(dial_duration, 0)
-    duration = max(base_duration, base_duration + max(dial_seconds, 0))
-    reason = pending.get("reason") or "Caller requested human handoff"
-    summary_base = (pending.get("summary") or "").strip()
-    if transfer_status == "completed":
-        summary = (
-            f"{summary_base} Transfer completed to human."
-            if summary_base
-            else f"Caller requested human handoff ({reason}); transfer completed."
-        )
-    else:
-        summary = (
-            f"{summary_base} Transfer failed or was not answered; callback needed."
-            if summary_base
-            else f"Caller requested human handoff ({reason}); transfer failed or was not answered, so callback is needed."
-        )
-
-    await log_call_to_dashboard(
-        config=pending.get("config", {}),
-        twilio_call_sid=call_sid,
-        from_number=pending.get("from_number", ""),
-        to_number=pending.get("to_number", ""),
-        duration=duration,
-        outcome=outcome,
-        summary=summary,
-        caller_name=pending.get("caller_name") or "",
-        appointment_date=pending.get("appointment_date") or "",
-        sms_consent=pending.get("sms_consent"),
-        transfer_reason=reason,
-        transfer_status=transfer_status,
-        callback_requested=callback_requested,
-        callback_due_at=pending.get("callback_due_at"),
-    )
-    remember_terminal_transfer_state(
-        call_sid,
-        transfer_status,
-        reason=reason,
-        callback_requested=callback_requested,
-        summary=summary,
-    )
-
-    logger.info(
-        f"Transfer status recorded for {call_sid}: "
-        f"status={transfer_status} dial_status={status or 'missing'} dial_call_sid={dial_call_sid or 'missing'}"
-    )
-    pending["terminal_logged"] = True
-    pending["transfer_status"] = transfer_status
-    pending["callback_requested"] = callback_requested
-    pending["duration"] = duration
-    pending["summary"] = summary
-    if call_sid not in _call_contexts:
-        _pending_transfers.pop(call_sid, None)
-
-    if callback_requested:
-        return (
-            '<Response><Say voice="Polly.Joanna">'
-            "We were not able to reach anyone right now. We have marked this for a callback. Goodbye."
-            "</Say><Hangup/></Response>"
-        )
-    return "<Response><Hangup/></Response>"

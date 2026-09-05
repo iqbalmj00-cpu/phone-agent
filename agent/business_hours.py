@@ -180,6 +180,33 @@ def is_currently_within_business_hours(config: dict[str, Any], now: datetime | N
     }, config)
 
 
+def _names_an_open_day(config: dict[str, Any]) -> bool:
+    """True when the per-day weekly map marks at least one day open."""
+    if not isinstance(config.get("businessHours"), dict):
+        return False
+    return any(
+        found and window is not None
+        for found, window in (get_exact_business_window(config, day) for day in range(7))
+    )
+
+
+def evaluate_current_business_hours(config: dict[str, Any], now: datetime | None = None) -> bool:
+    """Is the business open right now? Decides whether a handoff can connect.
+
+    Delegates to `is_currently_within_business_hours`, which `phone_coverage`
+    also uses, with one correction: a weekly map whose every day is closed means
+    the operator never configured hours, not that they are never open. The
+    dashboard produces exactly that from an empty `businessDays`, and taken
+    literally it would refuse every handoff forever while the agent went on
+    telling callers the business was open — `format_days_label` falls back to
+    the aggregate fields for the same reason, and the gate has to agree with
+    what the caller is being told.
+    """
+    if isinstance(config.get("businessHours"), dict) and not _names_an_open_day(config):
+        config = {key: value for key, value in config.items() if key != "businessHours"}
+    return is_currently_within_business_hours(config, now)
+
+
 def format_business_hours_for_day(config: dict[str, Any], date: datetime) -> str:
     js_day = (date.weekday() + 1) % 7
     exact_found, exact_window = get_exact_business_window(config, js_day)
@@ -223,18 +250,35 @@ def format_days_label(config: dict[str, Any]) -> str:
                 open_days.append(day)
         if open_days:
             active = [DAY_NAMES[d] for d in open_days]
-            if len(active) == 1:
-                return active[0]
-            return f"{active[0]} through {active[-1]}" if _is_contiguous(open_days) else ", ".join(active)
+            if _is_contiguous(open_days) and len(active) > 1:
+                return f"{active[0]} through {active[-1]}"
+            return _spoken_day_list(active)
 
     biz_days = config.get("businessDays", [0, 1, 2, 3, 4, 5])
-    active = [DAY_NAMES[d] for d in sorted(biz_days) if 0 <= d <= 6]
+    # The dashboard stores this array unfiltered, so it can arrive with repeats
+    # or out of order. A repeat makes _is_contiguous see a zero delta and the
+    # label names the same day twice.
+    sorted_days = sorted({d for d in biz_days if 0 <= d <= 6})
+    active = [DAY_NAMES[d] for d in sorted_days]
     if not active:
         return "Monday through Saturday"
-    if len(active) == 1:
-        return active[0]
-    sorted_days = sorted(d for d in biz_days if 0 <= d <= 6)
-    return f"{active[0]} through {active[-1]}" if _is_contiguous(sorted_days) else ", ".join(active)
+    if _is_contiguous(sorted_days) and len(active) > 1:
+        return f"{active[0]} through {active[-1]}"
+    return _spoken_day_list(active)
+
+
+def _spoken_day_list(active: list[str]) -> str:
+    """Join day names the way a person says them out loud.
+
+    "Monday, Wednesday, Friday" read aloud is a flat comma list that runs
+    straight into the opening time. A person says "Mondays, Wednesdays and
+    Fridays". A single open day becomes "Saturdays only", because bare
+    "Saturday" sounds like an offer of one particular date.
+    """
+    plural = [f"{day}s" for day in active]
+    if len(plural) == 1:
+        return f"{plural[0]} only"
+    return f"{', '.join(plural[:-1])} and {plural[-1]}"
 
 
 def _is_contiguous(days: list[int]) -> bool:

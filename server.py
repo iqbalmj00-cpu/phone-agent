@@ -42,7 +42,6 @@ from agent.phone_coverage import (
     resolve_phone_coverage_decision,
 )
 from agent.dashboard_redirect import redirect_live_call_via_dashboard
-from agent.handlers import process_transfer_status_callback, sanitize_transfer_reason_token
 
 app = FastAPI(title="ScaleYourJunk Phone Agent")
 
@@ -222,36 +221,6 @@ async def twiml_webhook(client_id: str, request: Request):
     </Connect>
 </Response>"""
 
-    return PlainTextResponse(content=twiml, media_type="application/xml")
-
-
-@app.post("/transfer-status/{client_id}/{call_sid}")
-async def transfer_status_webhook(client_id: str, call_sid: str, request: Request):
-    """Twilio <Dial action> callback used to record real handoff result."""
-    form_data = await request.form()
-    dial_status = str(form_data.get("DialCallStatus", "") or "")
-    dial_call_sid = str(form_data.get("DialCallSid", "") or "")
-    dial_duration = form_data.get("DialCallDuration", 0)
-    raw_transfer_reason = str(request.query_params.get("reason", "") or "")
-    transfer_reason = sanitize_transfer_reason_token(raw_transfer_reason)
-    if raw_transfer_reason and not transfer_reason:
-        logger.warning(
-            f"Ignoring unknown transfer reason token for client={client_id} call={call_sid}: "
-            f"{raw_transfer_reason[:80]!r}"
-        )
-    logger.info(
-        f"Transfer status callback: client={client_id} call={call_sid} "
-        f"dial_status={dial_status or 'missing'}"
-    )
-    twiml = await process_transfer_status_callback(
-        client_id=client_id,
-        call_sid=call_sid,
-        dial_status=dial_status,
-        dial_call_sid=dial_call_sid,
-        dial_duration=dial_duration,
-        callback_data=dict(form_data),
-        transfer_reason=transfer_reason,
-    )
     return PlainTextResponse(content=twiml, media_type="application/xml")
 
 

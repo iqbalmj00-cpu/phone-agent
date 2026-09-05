@@ -5,7 +5,6 @@ from zoneinfo import ZoneInfo
 from agent.phone_coverage import (
     DASHBOARD_ORIGIN_AI_TRANSFER,
     build_dashboard_handoff_redirect_twiml,
-    build_handoff_twiml,
     build_no_handoff_twiml,
     evaluate_weekly_hours,
     resolve_phone_coverage_decision,
@@ -93,24 +92,6 @@ class PhoneCoverageTests(unittest.TestCase):
         self.assertFalse(result.is_valid)
         self.assertIn("sun", result.error or "")
 
-    def test_handoff_twiml_includes_dial_action_and_escaped_values(self):
-        twiml = build_handoff_twiml(
-            company_name="A&B Junk",
-            forwarding_phone="555-123-4567",
-            caller_id="+15559990000",
-            base_url="https://agent.example.com",
-            client_id="client/id",
-            call_sid="CA/123",
-            reason="phone_coverage_off",
-        )
-        self.assertIsNotNone(twiml)
-        assert twiml is not None
-        self.assertIn("A&amp;B Junk", twiml)
-        self.assertIn("<Dial ", twiml)
-        self.assertIn("+15551234567", twiml)
-        self.assertIn('callerId="+15559990000"', twiml)
-        self.assertIn("/transfer-status/client%2Fid/CA%2F123?reason=phone_coverage_off", twiml)
-
     def test_dashboard_handoff_redirect_twiml_uses_dashboard_agent_transfer(self):
         twiml = build_dashboard_handoff_redirect_twiml(
             company_name="A&B Junk",
@@ -128,27 +109,6 @@ class PhoneCoverageTests(unittest.TestCase):
             twiml,
         )
         self.assertNotIn("<Dial", twiml)
-
-    def test_handoff_twiml_without_call_sid_has_post_dial_fallback(self):
-        twiml = build_handoff_twiml(
-            company_name="Test Co",
-            forwarding_phone="+15551234567",
-            caller_id="",
-            base_url="https://agent.example.com",
-            client_id="client",
-            call_sid="",
-            reason="phone_coverage_off",
-        )
-        self.assertIsNotNone(twiml)
-        assert twiml is not None
-        self.assertNotIn("action=", twiml)
-        self.assertIn("We were unable to reach anyone", twiml)
-
-    def test_missing_forwarding_phone_returns_no_handoff_twiml_builder(self):
-        self.assertIsNone(build_handoff_twiml(company_name="Test", forwarding_phone=""))
-        fallback = build_no_handoff_twiml("A&B Junk")
-        self.assertIn("A&amp;B Junk", fallback)
-        self.assertIn("<Hangup/>", fallback)
 
 
 if __name__ == "__main__":

@@ -111,7 +111,7 @@ class PhoneVersusTimeTests(ScheduleCallbackTests):
         """The model passes prose here as often as digits."""
         await self._schedule(
             201,
-            {"callbackDueAt": "2026-09-10T14:00:00-05:00"},
+            {"success": True, "callbackTaskId": "task-fixture", "callbackDueAt": "2026-09-10T14:00:00-05:00"},
             caller_phone="the number you're calling from",
         )
         self.assertEqual(self.sent["callerPhone"], self.CALLER)
@@ -140,7 +140,7 @@ class UnrecoverableTests(ScheduleCallbackTests):
 
     async def test_a_success_clears_the_count(self):
         await self._schedule(422, {"error": "requestedTime is outside business hours"})
-        await self._schedule(201, {"callbackDueAt": "2026-09-10T14:00:00-05:00"})
+        await self._schedule(201, {"success": True, "callbackTaskId": "task-fixture", "callbackDueAt": "2026-09-10T14:00:00-05:00"})
         again = await self._schedule(422, {"error": "requestedTime is outside business hours"})
         self.assertEqual(again["error"], "invalid_callback_time")
 

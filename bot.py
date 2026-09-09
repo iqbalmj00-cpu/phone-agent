@@ -15,6 +15,8 @@ Handles:
 """
 
 import asyncio
+import time
+from agent.silence import watch_silence
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -24,6 +26,7 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     Frame,
+    UserStartedSpeakingFrame, UserStoppedSpeakingFrame, BotStartedSpeakingFrame, BotStoppedSpeakingFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
@@ -69,7 +72,7 @@ from config import (
     TWILIO_ACCOUNT_SID,
     TWILIO_AUTH_TOKEN,
 )
-from agent.prompt import build_greeting, build_system_prompt, client_supports_dumpsters
+from agent.prompt import build_greeting, build_system_prompt, client_supports_dumpsters, client_supports_junk
 from agent.handlers import (
     handle_create_booking,
     handle_check_container_availability,
@@ -91,6 +94,7 @@ from agent.handlers import (
     was_transfer_complete,
     get_transfer_state,
     get_booking_log_state,
+    get_booking_outcome,
     create_lead_from_call,
     get_caller_name,
     has_sms_consent,
@@ -134,9 +138,17 @@ class CallerSpeechTracker(FrameProcessor):
     def __init__(self, *, on_user_transcript, **kwargs):
         super().__init__(**kwargs)
         self._on_user_transcript = on_user_transcript
+        self.user_speaking = False
+        self.bot_speaking = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
+        if isinstance(frame, (UserStartedSpeakingFrame, UserStoppedSpeakingFrame)):
+            self.user_speaking = isinstance(frame, UserStartedSpeakingFrame)
+            self._on_user_transcript("")
+        if isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
+            self.bot_speaking = isinstance(frame, BotStartedSpeakingFrame)
 
         if isinstance(frame, TranscriptionFrame) and frame.text:
             self._on_user_transcript(frame.text)
@@ -443,7 +455,12 @@ async def run_post_call(
     transfer_status = transfer_state.get("transfer_status")
     callback_requested = bool(transfer_state.get("callback_requested"))
     # Determine call outcome
-    if booked:
+    operation = get_booking_outcome(call_id)
+    if operation in ("rescheduled", "cancelled"):
+        outcome = operation
+    elif operation in ("pending", "uncertain"):
+        outcome = "booking_" + operation
+    elif booked:
         outcome = "booked"
     elif callback_requested or transfer_status in ("failed", "unavailable_no_forwarding_phone"):
         outcome = "callback_requested"
@@ -454,56 +471,53 @@ async def run_post_call(
     else:
         outcome = "info_only"
 
-    caller_name = str(booking_log_state.get("caller_name") or "") or get_caller_name(call_id)
-    appointment_date = str(booking_log_state.get("appointment_date") or "")
+    caller_name = get_caller_name(call_id) or str(booking_log_state.get("caller_name") or "")
+    appointment_date = "" if operation in ("uncertain", "pending") else str(booking_log_state.get("appointment_date") or "")
 
-    # Dashboard-routed transfers are finalized by dashboard Twilio callbacks.
-    # A normal phone-agent call-log update here can arrive late and downgrade
-    # dashboard_answered/handoff_answered back to requested/dialing.
-    if dashboard_owned_transfer:
-        logger.info(f"Skipping phone-agent final call log for dashboard-owned transfer {call_id}")
-    else:
-        # Log call to dashboard and wait briefly so the process cannot exit before
-        # the POST is sent. Dashboard returns 201 on create and 200 on duplicate update.
-        #
-        # Retry on the RESULT, not on a timeout. `log_call_to_dashboard` sets its
-        # own 10s client timeout and swallows every failure into `False`, so the
-        # 12s wait_for below almost never raises — an earlier version retried on
-        # `asyncio.TimeoutError` and could therefore never fire at all. Retrying
-        # is safe because the route looks the call up by its Twilio SID and
-        # updates rather than inserting; lead capture below has no such key and
-        # is never retried.
-        log_args = dict(
-            config=saved_config,
-            twilio_call_sid=call_id,
-            from_number=saved_caller or "",
-            to_number=saved_twilio_number,
-            duration=duration_s,
-            outcome=outcome,
-            summary=summary or "",
-            caller_name=caller_name,
-            appointment_date=appointment_date,
-            sms_consent=sms_consented,
-            transfer_reason=transfer_state.get("transfer_reason"),
-            transfer_status=transfer_status,
-            callback_requested=callback_requested,
-            callback_due_at=transfer_state.get("callback_due_at"),
-        )
-        logged = False
-        for attempt in (1, 2):
-            try:
-                logged = await asyncio.wait_for(
-                    log_call_to_dashboard(**log_args),
-                    timeout=CALL_LOG_WAIT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logged = False
-            if logged:
-                break
-            if attempt == 1:
-                logger.warning(f"Call log for {call_id} did not land; retrying once")
-        if not logged:
-            logger.error(f"Call log for {call_id} failed twice; giving up")
+    # Dashboard owns routing; its receiver permits safe contact/summary enrichment.
+    # Log call to dashboard and wait briefly so the process cannot exit before
+    # the POST is sent. Dashboard returns 201 on create and 200 on duplicate update.
+    #
+    # Retry on the RESULT, not on a timeout. `log_call_to_dashboard` sets its
+    # own 10s client timeout and swallows every failure into `False`, so the
+    # 12s wait_for below almost never raises — an earlier version retried on
+    # `asyncio.TimeoutError` and could therefore never fire at all. Retrying
+    # is safe because the route looks the call up by its Twilio SID and
+    # updates rather than inserting; lead capture below has no such key and
+    # is never retried.
+    log_args = dict(
+        config=saved_config,
+        twilio_call_sid=call_id,
+        from_number=saved_caller or "",
+        to_number=saved_twilio_number,
+        duration=duration_s,
+        outcome=outcome,
+        summary=summary or "",
+        caller_name=caller_name,
+        appointment_date=appointment_date,
+        sms_consent=sms_consented,
+        transfer_reason=transfer_state.get("transfer_reason"),
+        transfer_status=transfer_status,
+        callback_requested=callback_requested,
+        callback_due_at=transfer_state.get("callback_due_at"),
+        callback_phone=transfer_state.get("callback_phone"),
+        callback_source=transfer_state.get("callback_source"),
+    )
+    logged = False
+    for attempt in (1, 2):
+        try:
+            logged = await asyncio.wait_for(
+                log_call_to_dashboard(**log_args),
+                timeout=CALL_LOG_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logged = False
+        if logged:
+            break
+        if attempt == 1:
+            logger.warning(f"Call log for {call_id} did not land; retrying once")
+    if not logged:
+        logger.error(f"Call log for {call_id} failed twice; giving up")
 
     # A caller who gave their name but did not book is still worth recording —
     # that is the whole reason the opening line asks who is calling (D12).
@@ -535,7 +549,7 @@ async def run_post_call(
 
 # ── Tool Definitions ────────────────────────────────────
 
-def _create_booking_schema(dumpster_enabled: bool) -> FunctionSchema:
+def _create_booking_schema(dumpster_enabled: bool, junk_enabled: bool = True) -> FunctionSchema:
     properties = {
         "name": {"type": "string", "description": "Customer full name"},
         "phone": {"type": "string", "description": "Customer phone number"},
@@ -554,6 +568,9 @@ def _create_booking_schema(dumpster_enabled: bool) -> FunctionSchema:
             "enum": ["pickup"],
             "description": "Use pickup for every junk removal job, including estimates and on-site quote requests.",
         },
+        "booking_reference": {"type": "string", "description": "Keep primary for the first booking and all its retries. Use a distinct stable reference only when the caller explicitly requests another separate booking; keep that reference on retries."},
+        "job_id": {"type": "string", "description": "Verified lookup job ID anchoring the selected rental; required for swap/final pickup."},
+        "rental_address_confirmed": {"type": "boolean", "description": "True only after caller confirms the selected rental stored address and pickup versus swap."},
         "promo_code": {"type": "string", "description": "Validated promo code to apply discount (optional)"},
     }
     description = (
@@ -568,11 +585,11 @@ def _create_booking_schema(dumpster_enabled: bool) -> FunctionSchema:
         }
         properties["type"] = {
             "type": "string",
-            "enum": ["pickup", "dumpster_rental", "dumpster_swap"],
+            "enum": (["pickup"] if junk_enabled else []) + ["dumpster_rental", "dumpster_swap", "dumpster_pickup"],
             "description": (
                 "Use pickup for all junk removal jobs, including estimate requests. "
                 "Use dumpster_rental for new dumpster deliveries and dumpster_swap "
-                "for swapping a full container for an empty one."
+                "for swapping a full container for an empty one. Use dumpster_pickup for final collection with no replacement."
             ),
         }
         properties["container_size"] = {
@@ -589,6 +606,10 @@ def _create_booking_schema(dumpster_enabled: bool) -> FunctionSchema:
             "this after reading back all details and receiving verbal confirmation "
             "from the caller."
         )
+
+    if dumpster_enabled and not junk_enabled:
+        description = "Book a dumpster rental, swap, or final pickup only after reading all details back and receiving explicit caller confirmation."
+        properties["type"]["description"] = "dumpster_rental is a new delivery; dumpster_swap replaces an on-site box; dumpster_pickup collects the box with no replacement."
 
     required = ["name", "phone", "address", "date", "description", "type"]
     if not dumpster_enabled:
@@ -626,10 +647,10 @@ def _check_container_availability_schema() -> FunctionSchema:
     )
 
 
-def build_tools(dumpster_enabled: bool) -> ToolsSchema:
+def build_tools(dumpster_enabled: bool, junk_enabled: bool = True) -> ToolsSchema:
     """Build the LLM tool surface for the client's actual capabilities."""
     standard_tools = [
-        _create_booking_schema(dumpster_enabled),
+        _create_booking_schema(dumpster_enabled, junk_enabled),
         FunctionSchema(
             name="lookup_appointment",
             description=(
@@ -710,8 +731,9 @@ def build_tools(dumpster_enabled: bool) -> ToolsSchema:
             description="Validate a promo or referral code. Call when the caller mentions having a discount code.",
             properties={
                 "code": {"type": "string", "description": "The promo code to validate"},
+                "service_type": {"type": "string", "enum": ["junk", "dumpster"], "description": "Service receiving this discount"},
             },
-            required=["code"],
+            required=["code", "service_type"],
         ),
         FunctionSchema(
             name="check_available_slots",
@@ -826,7 +848,7 @@ async def run_bot(
             ),
         })
 
-    call_tools = build_tools(dumpster_enabled)
+    call_tools = build_tools(dumpster_enabled, client_supports_junk(client_config))
     logger.info(
         f"Call config: company={company_name!r}, dumpster_enabled={dumpster_enabled}, "
         f"cartesia_model={CARTESIA_MODEL}, cartesia_speed={cartesia_speed:.2f}, "
@@ -957,7 +979,7 @@ async def run_bot(
 
         # Start call duration timer, post-booking silence watcher, and pre-booking silence watcher
         _timeout_task = asyncio.create_task(_call_timeout_watcher(task, context))
-        _booking_watcher_task = asyncio.create_task(_post_booking_watcher(task, context, call_id))
+        _booking_watcher_task = None
         _pre_silence_watcher_task = asyncio.create_task(_pre_booking_silence_watcher(task, context, call_id))
 
     _finalize_guard = _OnceGuard()
@@ -1005,112 +1027,16 @@ async def run_bot(
     # ── Pre-Booking Silence Watcher ────────────────────
 
     async def _pre_booking_silence_watcher(task, context, cid: str):
-        """Catch callers who never speak after the greeting (butt-dial, technical
-        issues, hesitant callers). At 30s of silence, prompt once. At 45s, say a
-        graceful goodbye and end. Stops as soon as the caller speaks OR a booking
-        starts (post-booking watcher takes over)."""
-        INITIAL_PROMPT_AT_SECONDS = 30
-        GOODBYE_AT_SECONDS = 45
-
         try:
-            # Capture the timestamp at watcher start. If it changes, caller spoke.
-            initial_timestamp = last_caller_speech_time
-            nudge_sent = False
-
-            while True:
-                await asyncio.sleep(3)
-
-                # If a booking has completed, the post-booking watcher handles it
-                if is_booking_complete(cid):
-                    return
-
-                # If the caller has spoken at any point, our job is done
-                if last_caller_speech_time != initial_timestamp:
-                    return
-
-                now = datetime.now(ZoneInfo(timezone))
-                elapsed = (now - initial_timestamp).total_seconds()
-
-                if elapsed >= INITIAL_PROMPT_AT_SECONDS and not nudge_sent:
-                    logger.info(f"Pre-booking silence at {INITIAL_PROMPT_AT_SECONDS}s for {cid} — sending nudge")
-                    await _queue_context_instruction(
-                        task,
-                        context,
-                        "The caller hasn't said anything yet. Gently check in: 'Hello? Are you still there?'",
-                    )
-                    nudge_sent = True
-
-                if elapsed >= GOODBYE_AT_SECONDS:
-                    logger.info(f"Pre-booking silence at {GOODBYE_AT_SECONDS}s — ending call {cid}")
-                    await _queue_context_instruction(
-                        task,
-                        context,
-                        "The caller still hasn't responded. Say briefly: 'Sounds like you might have called by mistake. Feel free to call us back anytime — have a great day!' Then stop talking.",
-                    )
-                    await asyncio.sleep(8)
-                    await task.cancel()
-                    return
-
+            await watch_silence(
+                activity=lambda: last_caller_speech_time,
+                busy=lambda: bool(get_inflight_tasks(cid)) or caller_speech_tracker.user_speaking or caller_speech_tracker.bot_speaking,
+                booked=lambda: is_booking_complete(cid),
+                speak=lambda text: _queue_context_instruction(task, context, text),
+                cancel=task.cancel, now=time.monotonic,
+            )
         except asyncio.CancelledError:
-            pass  # Call ended before silence watcher fired
-
-    # ── Post-Booking Silence Watcher ───────────────────
-
-    async def _post_booking_watcher(task, context, cid: str):
-        """After a booking completes, wait for the LLM to finish its natural
-        response, then start a silence timer. Nudge at 15s, hang up at 25s.
-        If the caller speaks, the timer resets."""
-        POST_BOOKING_SILENCE_SECONDS = 25
-        NUDGE_AFTER_SECONDS = 15
-
-        try:
-            # Phase 1: Wait for booking to complete
-            while not is_booking_complete(cid):
-                await asyncio.sleep(2)
-
-            logger.info(f"Booking complete for {cid} — starting post-booking silence watcher")
-
-            # Give the LLM time to finish its natural response
-            # (the system prompt already instructs it to ask "anything else?")
-            await asyncio.sleep(10)
-
-            # Reset speech timer so the countdown starts fresh
-            nonlocal last_caller_speech_time
-            last_caller_speech_time = datetime.now(ZoneInfo(timezone))
-            nudge_sent = False
-
-            # Phase 2: Silence timer with nudge and speech reset
-            while True:
-                now = datetime.now(ZoneInfo(timezone))
-                elapsed = (now - last_caller_speech_time).total_seconds()
-
-                # At 15s: gentle nudge
-                if elapsed >= NUDGE_AFTER_SECONDS and not nudge_sent:
-                    await _queue_context_instruction(
-                        task,
-                        context,
-                        "The caller has been quiet. Gently ask: 'Was there anything else you needed help with?'",
-                    )
-                    nudge_sent = True
-
-                # At 25s: say goodbye and hang up
-                if elapsed >= POST_BOOKING_SILENCE_SECONDS:
-                    logger.info(f"Post-booking silence ({POST_BOOKING_SILENCE_SECONDS}s) — ending call {cid}")
-
-                    await _queue_context_instruction(
-                        task,
-                        context,
-                        "The caller has been silent for a while. Say a brief, warm goodbye like: 'Alright, sounds like we're all set! We'll see you on your scheduled day. Have a great one!' Then stop talking.",
-                    )
-
-                    await asyncio.sleep(8)
-                    await task.cancel()
-                    return
-
-                await asyncio.sleep(3)
-
-        except asyncio.CancelledError:
-            pass  # Call ended before silence timer fired
+            pass
 
     # ── Call Timer ──────────────────────────────────────
 

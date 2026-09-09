@@ -5,10 +5,10 @@ from agent import dashboard_redirect
 
 
 class FakeResponse:
-    def __init__(self, status=200, text='{"ok":true}', json_body=None):
+    def __init__(self, status=200, text='{"success":true,"transferStatus":"dashboard_redirected"}', json_body=None):
         self.status = status
         self._text = text
-        self._json_body = {"ok": True} if json_body is None else json_body
+        self._json_body = {"success": True, "transferStatus": "dashboard_redirected"} if json_body is None else json_body
 
     async def text(self):
         return self._text
@@ -40,7 +40,7 @@ class FakeSession:
 
 class DashboardRedirectTests(unittest.IsolatedAsyncioTestCase):
     async def test_redirect_live_call_posts_secure_dashboard_payload(self):
-        session = FakeSession(FakeResponse(status=202, json_body={"accepted": True}))
+        session = FakeSession(FakeResponse(status=200, json_body={"success": True, "transferStatus": "dashboard_redirected"}))
 
         with patch.object(dashboard_redirect.aiohttp, "ClientSession", return_value=session):
             result = await dashboard_redirect.redirect_live_call_via_dashboard(
@@ -55,7 +55,7 @@ class DashboardRedirectTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.status, 202)
+        self.assertEqual(result.status, 200)
         self.assertEqual(len(session.requests), 1)
         request = session.requests[0]
         self.assertEqual(

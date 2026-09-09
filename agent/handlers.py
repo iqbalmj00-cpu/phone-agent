@@ -17,6 +17,9 @@ ENDPOINT MAPPING (dashboard ↔ phone agent):
 import asyncio
 import contextvars
 import json
+import hashlib
+import uuid
+from functools import wraps
 import re
 import time
 import aiohttp
@@ -36,7 +39,8 @@ from agent.business_hours import (
 from agent.dashboard_redirect import redirect_live_call_via_dashboard
 from agent.phone_coverage import DASHBOARD_ORIGIN_AI_TRANSFER
 from agent.prosody import format_address_for_speech
-from agent.prompt import client_supports_dumpsters
+from agent.prompt import client_supports_dumpsters, client_supports_junk
+from agent.booking_outcome import booking_outcome, sms_guidance
 from client_config import get_client_config
 from config import (
     DASHBOARD_URL,
@@ -54,6 +58,17 @@ _current_call_sid: contextvars.ContextVar[str] = contextvars.ContextVar("current
 # Twilio <Dial action> callbacks arrive after the media stream has ended, so
 # transfer state must outlive the normal per-call context.
 _terminal_transfer_states: dict[str, dict[str, Any]] = {}
+_TERMINAL_TRANSFER_TTL_SECONDS = 3600
+_TERMINAL_TRANSFER_MAX_ENTRIES = 2048
+
+def _prune_terminal_transfers():
+    now = time.monotonic()
+    for sid, value in list(_terminal_transfer_states.items()):
+        if now - value.get("remembered_at", 0) >= _TERMINAL_TRANSFER_TTL_SECONDS:
+            _terminal_transfer_states.pop(sid, None)
+    while len(_terminal_transfer_states) > _TERMINAL_TRANSFER_MAX_ENTRIES:
+        _terminal_transfer_states.pop(next(iter(_terminal_transfer_states)))
+
 _TRANSFER_SUCCESS_STATUSES = {"completed", "answered"}
 _TRANSFER_FAILURE_STATUSES = {"busy", "no-answer", "failed", "canceled"}
 _TRANSFER_TERMINAL_STATUSES = {"completed", "failed", "unavailable_no_forwarding_phone"}
@@ -87,6 +102,38 @@ def mark_booking_complete(call_sid: str, details: dict[str, Any] | None = None):
         if details:
             current = _call_contexts[call_sid].setdefault("booking_details", {})
             current.update({k: v for k, v in details.items() if v is not None})
+
+
+def mark_booking_outcome(call_sid: str, outcome: str, details: dict[str, Any]):
+    ctx = _call_contexts.get(call_sid)
+    if ctx is None:
+        return
+    ctx["booking_outcome"] = outcome
+    if outcome == "scheduled":
+        mark_booking_complete(call_sid, details)
+        ctx.setdefault("bookings", {})[details["job_id"]] = dict(details)
+    elif not ctx.get("bookings"):
+        ctx["booking_complete"] = False
+        ctx["booking_details"] = {}
+
+
+def mark_booking_change(call_sid: str, job_id: str, *, cancelled: bool = False, appointment: str = ""):
+    ctx = _call_contexts.get(call_sid, {})
+    bookings = ctx.setdefault("bookings", {})
+    if cancelled:
+        bookings.pop(job_id, None)
+        ctx["booking_outcome"] = "cancelled"
+    else:
+        bookings.setdefault(job_id, {})["appointment_date"] = appointment
+        ctx["booking_outcome"] = "rescheduled"
+    ctx["booking_complete"] = bool(bookings)
+    if cancelled and bookings:
+        ctx["booking_outcome"] = "scheduled"
+    ctx["booking_details"] = dict(list(bookings.values())[-1]) if bookings else {}
+
+
+def get_booking_outcome(call_sid: str) -> str:
+    return str(_call_contexts.get(call_sid, {}).get("booking_outcome", ""))
 
 
 def set_pipeline_task(call_sid: str, task):
@@ -171,7 +218,10 @@ def remember_terminal_transfer_state(
     """Remember terminal transfer state so later final logs cannot downgrade it."""
     if not call_sid or status not in _TRANSFER_TERMINAL_STATUSES:
         return
+    _prune_terminal_transfers()
+    _terminal_transfer_states.pop(call_sid, None)
     _terminal_transfer_states[call_sid] = {
+        "remembered_at": time.monotonic(),
         "transfer_status": status,
         "transfer_reason": reason,
         "callback_requested": callback_requested,
@@ -179,8 +229,11 @@ def remember_terminal_transfer_state(
         "terminal_logged": True,
     }
 
+    _prune_terminal_transfers()
+
 
 def get_terminal_transfer_state(call_sid: str) -> dict[str, Any]:
+    _prune_terminal_transfers()
     terminal = _terminal_transfer_states.get(call_sid)
     return dict(terminal) if terminal else {}
 
@@ -189,11 +242,15 @@ def mark_callback_requested(
     call_sid: str,
     due_at: str | None = None,
     reason: str | None = None,
+    phone: str | None = None,
 ):
     """Record scheduled callback state for the final call log."""
     if call_sid not in _call_contexts:
         return
     _call_contexts[call_sid]["callback_requested"] = True
+    _call_contexts[call_sid]["callback_source"] = "explicit"
+    if phone:
+        _call_contexts[call_sid]["callback_phone"] = phone
     if due_at:
         _call_contexts[call_sid]["callback_due_at"] = due_at
     if reason:
@@ -209,13 +266,15 @@ def get_transfer_state(call_sid: str) -> dict[str, Any]:
         "callback_requested": ctx.get("callback_requested", False),
         "callback_due_at": ctx.get("callback_due_at"),
         "callback_reason": ctx.get("callback_reason"),
+        "callback_phone": ctx.get("callback_phone"),
+        "callback_source": ctx.get("callback_source", "transfer_fallback"),
     }
     terminal = get_terminal_transfer_state(call_sid)
     if terminal:
         state.update({
             "transfer_status": terminal.get("transfer_status") or state.get("transfer_status"),
             "transfer_reason": terminal.get("transfer_reason") or state.get("transfer_reason"),
-            "callback_requested": bool(terminal.get("callback_requested")),
+            "callback_requested": bool(terminal.get("callback_requested")) or ctx.get("callback_source") == "explicit",
         })
     return state
 
@@ -1175,7 +1234,11 @@ async def _safe_json(resp: aiohttp.ClientResponse, label: str) -> dict:
     """Parse JSON safely, logging raw text on failure."""
     text = await resp.text()
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            logger.error(f"[{label}] Expected a JSON object (status {resp.status})")
+            return {"error": "Dashboard returned an invalid response shape"}
+        return parsed
     except (json.JSONDecodeError, ValueError):
         logger.error(f"[{label}] Non-JSON response (status {resp.status}): {text[:500]}")
         return {"error": f"Dashboard returned non-JSON (status {resp.status})"}
@@ -1632,7 +1695,7 @@ async def handle_validate_promo_code(params: FunctionCallParams):
         async with aiohttp.ClientSession() as http:
             resp = await http.get(
                 f"{DASHBOARD_URL}/api/promo/validate",
-                params={"code": code},
+                params={"code": code, "serviceType": params.arguments.get("service_type", "junk")},
                 headers=_ingest_headers(config),
                 timeout=aiohttp.ClientTimeout(total=10),
             )
@@ -1642,9 +1705,9 @@ async def handle_validate_promo_code(params: FunctionCallParams):
                 discount_type = data.get("discountType", "percentage")
                 discount_value = data.get("discountValue", 0)
                 if discount_type == "percentage":
-                    msg = f"Code {code.upper()} is valid — {discount_value}% discount. Include this code when booking."
+                    msg = f"Code {code.upper()} is valid — {discount_value}% discount. Validation is provisional; the booking response must confirm the accepted discount."
                 else:
-                    msg = f"Code {code.upper()} is valid — ${discount_value:.0f} off. Include this code when booking."
+                    msg = f"Code {code.upper()} is valid — ${discount_value:.0f} off. Validation is provisional; the booking response must confirm the accepted discount."
                 await params.result_callback({
                     "valid": True,
                     "code": code.upper(),
@@ -1822,21 +1885,30 @@ async def handle_create_booking(params: FunctionCallParams):
     rental_duration_days = _normalize_rental_days(params.arguments.get("rental_duration_days", 7))
     call_sid = ctx.get("call_sid", "")
 
-    is_dumpster = booking_type in ("dumpster_rental", "dumpster_swap")
-    is_swap = booking_type == "dumpster_swap"
+    is_dumpster = booking_type in ("dumpster_rental", "dumpster_swap", "dumpster_pickup")
+    is_swap = booking_type in ("dumpster_swap", "dumpster_pickup")
+    is_final_pickup = booking_type == "dumpster_pickup"
     service_type = booking_type if is_dumpster else "junk_removal"
 
-    if is_dumpster and not client_supports_dumpsters(config):
+    if (is_dumpster and not client_supports_dumpsters(config)) or (not is_dumpster and not client_supports_junk(config)):
         await params.result_callback({
             "fallback": True,
             "error": "unsupported_service",
             "message": (
-                "This client does not offer dumpster rentals. Do not create a "
-                "dumpster booking. Redirect to junk removal pickup or offer a "
-                "human transfer."
+                "This client does not offer that service. Do not book it. Explain the configured services or offer human help."
             ),
         })
         return
+
+    verified_job_id = None
+    if is_swap:
+        verified_job_id, selection_error = resolve_job_id_from_lookup(call_sid, phone, params.arguments.get("job_id"))
+        if selection_error:
+            await params.result_callback(selection_error)
+            return
+        if params.arguments.get("rental_address_confirmed") is not True:
+            await params.result_callback({"error": "confirm_selected_rental_address", "message": "Read back the selected rental address from lookup and confirm final pickup versus replacement before booking."})
+            return
 
     # ── Validate date ──
     parsed_date = _validate_date(date)
@@ -1911,19 +1983,7 @@ async def handle_create_booking(params: FunctionCallParams):
     # ── Build notes ──
     if is_swap:
         size_str = f"{container_size}-yard" if container_size else "current size"
-        # A final pickup is booked as a swap because the dashboard has no
-        # pickup-only type, and the prompt says so in the description. The note
-        # the crew reads must not then promise a replacement container the
-        # caller explicitly turned down.
-        lowered = str(description or "").lower()
-        pickup_only = any(
-            phrase in lowered
-            for phrase in ("pickup-only", "pickup only", "pick up only", "no replacement", "final pickup")
-        )
-        if pickup_only:
-            notes = f"FINAL PICKUP — collect the {size_str} container, do NOT drop off a replacement. {description}"
-        else:
-            notes = f"Dumpster Swap: pick up full {size_str} container, drop off empty. {description}"
+        notes = (f"FINAL PICKUP — no replacement. {description}" if is_final_pickup else f"Dumpster Swap: pick up full {size_str} container, drop off empty. {description}")
     elif is_dumpster:
         size_str = f"{container_size}-yard" if container_size else "TBD size"
         safe_description = _dashboard_safe_duration_notes(description)
@@ -1949,6 +2009,8 @@ async def handle_create_booking(params: FunctionCallParams):
         "serviceType": service_type,
         "twilioCallSid": ctx.get("call_sid", ""),
     }
+    if verified_job_id:
+        payload.update({"verifiedJobId": verified_job_id, "identityVerified": True})
     if is_dumpster:
         payload["containerSize"] = container_size
         payload["rentalDays"] = rental_duration_days
@@ -1956,6 +2018,16 @@ async def handle_create_booking(params: FunctionCallParams):
     promo_code = params.arguments.get("promo_code")
     if promo_code:
         payload["promoCode"] = promo_code
+
+    # Freeze each intent before the network await. A different explicit reference permits
+    # an intentional identical second booking; retries must keep the same reference.
+    fingerprint = hashlib.sha256(json.dumps({**payload, "booking_reference": params.arguments.get("booking_reference", "primary")}, sort_keys=True).encode()).hexdigest()
+    outstanding = ctx.get("outstanding_booking")
+    if outstanding and outstanding != fingerprint:
+        await params.result_callback({"error": "booking_unresolved", "message": "The earlier booking outcome is uncertain. Retry those same details or ask staff to reconcile it before creating different work."})
+        return
+    payload["bookingIntentId"] = ctx.setdefault("booking_intents", {}).setdefault(fingerprint, str(uuid.uuid4()))
+    ctx["outstanding_booking"] = fingerprint
 
     # ── Include SMS consent in booking payload ──
     # Critical: dashboard sends confirmation SMS immediately on booking creation.
@@ -1988,99 +2060,38 @@ async def handle_create_booking(params: FunctionCallParams):
                     timeout=aiohttp.ClientTimeout(total=15),
                 )
 
-                if resp.status == 201:
-                    # Mark IMMEDIATELY — before any further awaits — so the
-                    # disconnect handler always sees this booking, even if
-                    # subsequent JSON parsing or callback delivery is interrupted.
-                    if call_sid:
-                        mark_booking_complete(call_sid, {
-                            "caller_name": name,
-                            "appointment_date": local_datetime,
-                        })
-                        reset_tool_failure(call_sid, "create_booking")
-                        reset_tool_failure(call_sid, "create_booking_capacity")
-
-                    data = await _safe_json(resp, "create-booking")
-                    job_id = data.get("jobId", "confirmed")
-                    label = "Dumpster swap" if is_swap else "Dumpster rental" if is_dumpster else "Booking"
-                    logger.info(f"{label} created: jobId={job_id} for {name} on {date} ({slot['period']} window)")
-
-                    auto_booked = data.get("autoBooked", False)
-                    # The dashboard branches its own SMS copy on `scheduled`, so
-                    # branching on the same field keeps the voice and the text
-                    # saying the same thing by construction. They move together
-                    # for swaps; `autoBooked` is the fallback for older shapes.
-                    scheduled = data.get("scheduled", auto_booked)
-
-                    if is_swap and scheduled:
-                        # No text is sent for a scheduled swap — by design, the
-                        # voice is the only confirmation the customer gets.
-                        result = {
-                            "success": True,
-                            "scheduled": True,
-                            "booking_id": str(job_id),
-                            "message": f"Swap confirmed for {spoken_date}, {spoken_slot}. Tell the caller we'll be out then. No confirmation text goes out for a booked swap, so what you say now is the only confirmation they get.",
-                        }
-                    elif is_swap:
-                        # A container has not been matched yet. The dashboard
-                        # texts "your swap request is in", so the voice must not
-                        # claim it is scheduled.
-                        result = {
-                            "success": True,
-                            "scheduled": False,
-                            "booking_id": str(job_id),
-                            "message": f"Swap request logged for {spoken_date}, but no container has been assigned yet. Do NOT tell the caller it is scheduled or give them a time. Say the request is in and the team will confirm the exact time with them. They will also get a text confirming we have it.",
-                        }
-                    elif is_dumpster and auto_booked:
-                        size_label = f"{container_size}-yard" if container_size else ""
-                        result = {
-                            "success": True,
-                            "autoBooked": True,
-                            "booking_id": str(job_id),
-                            "message": f"Dumpster rental CONFIRMED for {spoken_date}. {size_label} container, {rental_duration_days} day rental. Delivery is scheduled. If SMS consent was recorded earlier in the call, you may tell the caller they'll receive a confirmation text shortly. Do not promise an email unless the dashboard explicitly confirms one.",
-                        }
-                    elif is_dumpster:
-                        size_label = f"{container_size}-yard" if container_size else ""
-                        result = {
-                            "success": True,
-                            "autoBooked": False,
-                            "booking_id": str(job_id),
-                            "message": f"Dumpster rental request submitted for {spoken_date}. {size_label} container, {rental_duration_days} day rental. Our team will follow up to confirm availability and pricing.",
-                        }
-                    else:
-                        result = {
-                            "success": True,
-                            "booking_id": str(job_id),
-                            "message": f"Booking confirmed for {spoken_date}, {spoken_slot}.",
-                        }
-                elif resp.status == 200:
-                    # 201 books; a 200 is the dashboard declining the date on
-                    # purpose. It is NOT an error — the old code sent it down the
-                    # generic path, so the caller heard "trouble with our
-                    # scheduling system" and the alternative dates were binned.
-                    #
-                    # Gate on the `success` field, never the status: a proxy or
-                    # auth wall also answers 200, and `_safe_json` turns that
-                    # body into {"error": ...}, so `success` is None and it
-                    # correctly falls through to the error path below.
-                    data = await _safe_json(resp, "create-booking-refused")
-                    if data.get("success") is False:
+                data = await _safe_json(resp, "create-booking")
+                outcome = booking_outcome(resp.status, data)
+                if outcome in ("scheduled", "pending", "refused", "closed", "active"):
+                    ctx.pop("outstanding_booking", None)
+                if outcome == "scheduled":
+                    mark_booking_outcome(call_sid, outcome, {"caller_name": name, "appointment_date": data.get("appointmentDate") or local_datetime, "job_id": data["jobId"]})
+                    mark_caller_name(call_sid, name)
+                    reset_tool_failure(call_sid, "create_booking")
+                    reset_tool_failure(call_sid, "create_booking_capacity")
+                    label = "Final pickup, no replacement" if is_final_pickup else "Dumpster swap" if is_swap else "Dumpster rental" if is_dumpster else "Booking"
+                    result = {"success": True, "scheduled": True, "outcome": outcome, "booking_id": data["jobId"], "message": f"{label} confirmed for {spoken_date}, {spoken_slot}. {sms_guidance(data)}"}
+                    prices = data.get("prices") if isinstance(data.get("prices"), dict) else {}
+                    price = prices.get("dumpster" if is_dumpster else "junk")
+                    price = price if isinstance(price, dict) else {}
+                    result["accepted_price"] = price
+                    accepted_promo = price.get("promo") if isinstance(price.get("promo"), dict) else {}
+                    if promo_code and accepted_promo.get("status") != "applied":
+                        result["price_agreement_required"] = True
+                        result["message"] += " The requested promo is not confirmed on the saved booking. Explain the saved terms and get the caller's agreement; if they do not agree, seek staff review. Do not claim the discount applied."
+                elif outcome == "pending":
+                    mark_booking_outcome(call_sid, outcome, {})
+                    result = {"success": True, "scheduled": False, "outcome": outcome, "booking_id": data.get("jobId"), "message": f"The request for {spoken_date} is saved, but it is not scheduled. Staff must confirm availability and pricing. {sms_guidance(data)}"}
+                elif outcome == "refused":
+                    if isinstance(data.get("feasibility"), dict):
                         result = _build_capacity_refusal(call_sid, data, spoken_date)
                     else:
-                        logger.error(f"Booking API returned 200 without success:false: {data}")
-                        result = _build_error_with_tracking(
-                            call_sid,
-                            "create_booking",
-                            "I'm having trouble with our scheduling system. Let me take your info and have someone call you back.",
-                        )
+                        result = {"success": False, "outcome": outcome, "error": data.get("error", "booking_refused"), "message": data.get("message") or "The request was refused. No new service is confirmed. Explain the reason and seek staff help if needed."}
+                elif outcome in ("closed", "active"):
+                    result = {"success": True, "outcome": outcome, "scheduled": False, "message": "This intent already exists and is now active or closed. Do not promise another visit or create it again."}
                 else:
-                    text = await resp.text()
-                    logger.error(f"Booking API error: {resp.status} {text}")
-                    result = _build_error_with_tracking(
-                        call_sid,
-                        "create_booking",
-                        "I'm having trouble with our scheduling system. Let me take your info and have someone call you back.",
-                    )
+                    mark_booking_outcome(call_sid, "uncertain", {})
+                    result = {"success": False, "outcome": "uncertain", "error": "booking_outcome_uncertain", "message": "The booking may have been saved, but confirmation is unavailable. Do not say booked or failed. Retry the same intent/details or have staff reconcile it; do not create another booking."}
 
                 # Try to deliver result back to LLM — may no-op if the call ended
                 try:
@@ -2093,11 +2104,12 @@ async def handle_create_booking(params: FunctionCallParams):
             raise
         except Exception as e:
             logger.error(f"Booking creation error: {e}")
+            mark_booking_outcome(call_sid, "uncertain", {})
             try:
                 await params.result_callback(_build_error_with_tracking(
                     call_sid,
                     "create_booking",
-                    "I'm having trouble creating the booking right now. Let me take your info and have someone call you back.",
+                    "The booking outcome is uncertain. Retry the same details; do not submit a new intent or promise a callback until arranged.",
                 ))
             except Exception:
                 pass
@@ -2310,6 +2322,19 @@ async def handle_verify_caller_identity(params: FunctionCallParams):
     })
 
 
+def _tracked_mutation(handler):
+    @wraps(handler)
+    async def wrapped(params):
+        sid = _get_context().get("call_sid", "")
+        task = asyncio.create_task(handler(params))
+        if sid:
+            add_inflight_task(sid, task)
+            task.add_done_callback(lambda done: remove_inflight_task(sid, done))
+        return await asyncio.shield(task)
+    return wrapped
+
+
+@_tracked_mutation
 async def handle_reschedule_appointment(params: FunctionCallParams):
     """Reschedule an appointment.
 
@@ -2373,7 +2398,9 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
                 timeout=aiohttp.ClientTimeout(total=10),
             )
 
-            if resp.status == 200:
+            data = await _safe_json(resp, "reschedule")
+            if resp.status == 200 and data.get("success") is True:
+                mark_booking_change(call_sid, str(job_id), appointment=f"{new_date}T{slot['start']}:00")
                 reset_tool_failure(ctx.get("call_sid", ""), "reschedule_appointment")
                 await params.result_callback({
                     "success": True,
@@ -2381,22 +2408,26 @@ async def handle_reschedule_appointment(params: FunctionCallParams):
                 })
                 logger.info(f"Rescheduled for {phone} to {new_date} ({slot['period']} window)")
             else:
+                if data.get("outcome") != "refused":
+                    mark_booking_outcome(call_sid, "uncertain", {})
                 text = await resp.text()
                 logger.error(f"Reschedule API error: {resp.status} {text}")
                 await params.result_callback(_build_error_with_tracking(
                     ctx.get("call_sid", ""),
                     "reschedule_appointment",
-                    "Couldn't reschedule that appointment.",
+                    "The date change is not confirmed. If refused, the existing appointment remains; otherwise the result is uncertain and staff must reconcile it.",
                 ))
     except Exception as e:
+        mark_booking_outcome(call_sid, "uncertain", {})
         logger.error(f"Reschedule error: {e}")
         await params.result_callback(_build_error_with_tracking(
             ctx.get("call_sid", ""),
             "reschedule_appointment",
-            "I'm having trouble rescheduling right now.",
+            "The date-change outcome is uncertain. Do not claim it changed or failed; reconcile the same appointment.",
         ))
 
 
+@_tracked_mutation
 async def handle_cancel_appointment(params: FunctionCallParams):
     """Cancel an appointment.
 
@@ -2436,7 +2467,9 @@ async def handle_cancel_appointment(params: FunctionCallParams):
                 timeout=aiohttp.ClientTimeout(total=10),
             )
 
-            if resp.status == 200:
+            data = await _safe_json(resp, "cancel")
+            if resp.status == 200 and data.get("success") is True:
+                mark_booking_change(call_sid, str(job_id), cancelled=True)
                 reset_tool_failure(ctx.get("call_sid", ""), "cancel_appointment")
                 await params.result_callback({
                     "success": True,
@@ -2444,17 +2477,20 @@ async def handle_cancel_appointment(params: FunctionCallParams):
                 })
                 logger.info(f"Cancelled appointment for {phone}, reason: {reason}")
             else:
+                if data.get("outcome") != "refused":
+                    mark_booking_outcome(call_sid, "uncertain", {})
                 await params.result_callback(_build_error_with_tracking(
                     ctx.get("call_sid", ""),
                     "cancel_appointment",
-                    "Couldn't cancel that appointment.",
+                    "Cancellation is not confirmed. If refused, the existing appointment remains; otherwise the result is uncertain and staff must reconcile it.",
                 ))
     except Exception as e:
+        mark_booking_outcome(call_sid, "uncertain", {})
         logger.error(f"Cancel error: {e}")
         await params.result_callback(_build_error_with_tracking(
             ctx.get("call_sid", ""),
             "cancel_appointment",
-            "I'm having trouble processing the cancellation.",
+            "The cancellation outcome is uncertain. Do not claim it was cancelled or remains booked; reconcile the same appointment.",
         ))
 
 
@@ -2729,16 +2765,13 @@ async def handle_schedule_callback(params: FunctionCallParams):
                     timeout=aiohttp.ClientTimeout(total=15),
                 )
 
-                if resp.status in (200, 201):
+                data = await _safe_json(resp, "schedule-callback")
+                if resp.status in (200, 201) and data.get("success") is True and data.get("callbackTaskId") and data.get("callbackDueAt"):
+                    callback_due_at = data["callbackDueAt"]
                     if call_sid:
-                        mark_callback_requested(call_sid, requested_time, reason)
+                        mark_callback_requested(call_sid, str(callback_due_at), reason, caller_phone)
                         reset_tool_failure(call_sid, "schedule_callback")
                         reset_tool_failure(call_sid, "callback_time")
-
-                    data = await _safe_json(resp, "schedule-callback")
-                    callback_due_at = data.get("callbackDueAt") or requested_time
-                    if call_sid:
-                        mark_callback_requested(call_sid, str(callback_due_at), reason)
 
                     await _deliver_result({
                         "success": True,
@@ -2749,7 +2782,6 @@ async def handle_schedule_callback(params: FunctionCallParams):
                     })
                     return
 
-                data = await _safe_json(resp, "schedule-callback-error")
                 error_text = str(data.get("error") or "")
 
                 # 400 is about the PHONE, 422 is about the TIME. Collapsing them
@@ -2790,7 +2822,7 @@ async def handle_schedule_callback(params: FunctionCallParams):
                         )
                         await _deliver_result({
                             "error": "callback_hours_unavailable",
-                            "message": "A callback cannot be scheduled for this business right now. Tell the caller you have noted their request and someone will get back to them, then move on. Do not ask for another time.",
+                            "message": "A callback could not be arranged. Apologize and say so clearly; do not promise follow-up or claim a task exists. Offer human help during business hours, and do not ask for another time.",
                         })
                         return
                     await _deliver_result({
@@ -2833,6 +2865,7 @@ async def handle_schedule_callback(params: FunctionCallParams):
 
 # ── Human Handoff ──────────────────────────────────────
 
+@_tracked_mutation
 async def handle_transfer_to_human(params: FunctionCallParams):
     """Transfer the live call to the dashboard human handoff route.
 
@@ -2847,8 +2880,8 @@ async def handle_transfer_to_human(params: FunctionCallParams):
     call_sid = ctx.get("call_sid")
 
     # D21: outside business hours there is nobody to transfer to, so no handoff
-    # is attempted at all. The call is noted in the dashboard's Callback Queue
-    # and continues normally — no dashboard redirect, no pipeline cancel.
+    # is attempted at all. Retain the request for finalization, but do not
+    # claim a dashboard callback exists before its write is acknowledged.
     #
     # This sits ABOVE the "requested" write below. If the caller hangs up
     # between the two, that write would stand on its own and the call would be
@@ -2864,15 +2897,15 @@ async def handle_transfer_to_human(params: FunctionCallParams):
             )
         logger.info(
             f"Transfer suppressed outside business hours for call {call_sid} "
-            f"(reason: {reason}); caller added to the callback queue"
+            f"(reason: {reason}); callback request retained for finalization"
         )
         await params.result_callback({
             "transferred": False,
             "after_hours": True,
-            "say": "The office is closed right now, but I've left a note for the team and someone will give you a call back on this number.",
+            "say": "The office is closed right now. Your callback request isn't confirmed yet; you can also call the team during business hours.",
             "note": (
                 "AFTER HOURS. No transfer was attempted and none is possible; the "
-                "caller is already on the callback queue. Say the line above in your "
+                "callback request still needs a dashboard acknowledgement. Say the line above in your "
                 "own words. It is normal, not a fault, so do not apologise for a "
                 "problem and do not try to transfer again on this call. Then carry on "
                 "— you can still book, look up, reschedule and cancel."
@@ -2901,6 +2934,8 @@ async def handle_transfer_to_human(params: FunctionCallParams):
             call_sid=call_sid,
             reason=str(reason),
             origin=DASHBOARD_ORIGIN_AI_TRANSFER,
+            from_number=ctx.get("caller_number", ""),
+            to_number=config.get("twilioNumber", ""),
             dashboard_url=DASHBOARD_URL,
             platform_api_key=PLATFORM_API_KEY,
         )
@@ -2941,10 +2976,12 @@ async def handle_transfer_to_human(params: FunctionCallParams):
         logger.error(f"Transfer failed for call {call_sid}: {e}")
         if call_sid:
             mark_transfer_state(call_sid, "failed", reason, callback_requested=True)
+        logged = await log_call_to_dashboard(config, call_sid, ctx.get("caller_number", ""), config.get("twilioNumber", ""), 0,
+            "callback_requested", transfer_status="failed", transfer_reason=str(reason), callback_requested=True, callback_source="transfer_fallback")
         await params.result_callback({
             "transferred": False,
-            "say": "I couldn't get anyone on the line just now, but I've put a note in and someone from the team will get back to you.",
-            "note": "The transfer did not connect. The caller is on the callback queue. Do not promise a time and do not try again.",
+            "say": "The transfer outcome is unavailable. A follow-up request has been recorded." if logged else "I couldn't confirm the transfer or arrange a callback. Please call the team again during business hours.",
+            "note": "A later provider result may still show an answered transfer. Do not try another transfer or promise a callback time.",
         })
 
 
@@ -2980,6 +3017,8 @@ async def log_call_to_dashboard(
     transfer_status: str | None = None,
     callback_requested: bool | None = None,
     callback_due_at: str | None = None,
+    callback_phone: str | None = None,
+    callback_source: str | None = None,
 ) -> bool:
     """POST to dashboard call log endpoint. Returns True when accepted."""
     try:
@@ -2995,8 +3034,7 @@ async def log_call_to_dashboard(
             payload["callerName"] = caller_name
         if summary:
             payload["summary"] = summary
-        if appointment_date:
-            payload["appointmentDate"] = appointment_date
+        payload["appointmentDate"] = appointment_date or None
         # Include SMS consent decision for audit trail
         if sms_consent is not None:
             payload["smsConsent"] = sms_consent
@@ -3008,6 +3046,10 @@ async def log_call_to_dashboard(
             payload["callbackRequested"] = callback_requested
         if callback_due_at:
             payload["callbackDueAt"] = callback_due_at
+        if callback_phone:
+            payload["callbackPhone"] = callback_phone
+        if callback_source:
+            payload["callbackSource"] = callback_source
 
         async with aiohttp.ClientSession() as http:
             resp = await http.post(
@@ -3016,7 +3058,8 @@ async def log_call_to_dashboard(
                 headers=_agent_headers(config),
                 timeout=aiohttp.ClientTimeout(total=10),
             )
-            if resp.status in (200, 201):
+            data = await _safe_json(resp, "call-log")
+            if resp.status in (200, 201) and data.get("success") is True:
                 logger.info(f"Call log recorded: {twilio_call_sid} outcome={outcome}")
                 return True
             else:

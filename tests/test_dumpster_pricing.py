@@ -102,11 +102,11 @@ class HalfConfiguredTierTests(unittest.TestCase):
 
     def test_all_tiers_unpriced_falls_back_to_team_follow_up(self):
         block, *_ = _format_dumpster_pricing([_tier(20, rate=0)])
-        self.assertIn("our team will follow up with the exact pricing", block)
+        self.assertIn("our team must confirm the availability and price before it is scheduled", block)
 
     def test_no_tiers_falls_back_to_team_follow_up(self):
         block, *_ = _format_dumpster_pricing([])
-        self.assertIn("our team will follow up with the exact pricing", block)
+        self.assertIn("our team must confirm the availability and price before it is scheduled", block)
 
 
 class ConfiguredAmountsTests(unittest.TestCase):

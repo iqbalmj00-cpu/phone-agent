@@ -112,17 +112,16 @@ class RunPostCallTests(_PostCallHarness):
 
         self.assertEqual(logged.await_args.kwargs["outcome"], "info_only")
 
-    async def test_a_dashboard_owned_transfer_is_not_logged_here(self):
+    async def test_a_dashboard_owned_transfer_receives_safe_enrichment(self):
         """The dashboard finalizes its own transfers.
 
-        A late write from this side downgrades dashboard_answered back to
-        dialing, so the call log must be skipped — not merely duplicated.
+        The receiver protects terminal routing while accepting the AI summary and contact.
         """
         handlers.mark_dashboard_transfer_ownership(CALL_SID, "ai_transfer", reason="caller_requested")
 
         logged = await self._run()
 
-        self.assertEqual(logged.await_count, 0)
+        self.assertEqual(logged.await_count, 1)
 
     async def test_the_per_call_context_is_always_released(self):
         """This is the memory leak. The context holds the PipelineTask, and the

@@ -44,6 +44,8 @@ async def redirect_live_call_via_dashboard(
     endpoint_path: str = DASHBOARD_LIVE_CALL_REDIRECT_PATH,
     platform_api_key: str = PLATFORM_API_KEY,
     timeout_seconds: float = 8,
+    from_number: str = "",
+    to_number: str = "",
 ) -> DashboardLiveRedirectResult:
     """Ask dashboard to update a live Twilio call using tenant credentials."""
     url = _join_dashboard_url(dashboard_url, endpoint_path)
@@ -67,6 +69,10 @@ async def redirect_live_call_via_dashboard(
         "reason": str(reason or ""),
         "origin": str(origin or ""),
     }
+    if from_number:
+        payload["fromNumber"] = from_number
+    if to_number:
+        payload["toNumber"] = to_number
     headers = {
         "x-api-key": platform_api_key,
         "Content-Type": "application/json",
@@ -87,7 +93,7 @@ async def redirect_live_call_via_dashboard(
             except Exception:
                 body_json = None
 
-        if 200 <= response.status < 300:
+        if 200 <= response.status < 300 and body_json and body_json.get("success") is True and body_json.get("transferStatus") == "dashboard_redirected":
             return DashboardLiveRedirectResult(ok=True, status=response.status, response=body_json)
 
         logger.warning(

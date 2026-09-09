@@ -283,3 +283,19 @@ def _spoken_day_list(active: list[str]) -> str:
 
 def _is_contiguous(days: list[int]) -> bool:
     return all(days[i + 1] - days[i] == 1 for i in range(len(days) - 1))
+
+
+def format_weekly_business_hours(config: dict[str, Any]) -> str:
+    """Use exactly the same per-day windows as the booking validator."""
+    if not isinstance(config.get("businessStart", 7), int) or not isinstance(config.get("businessEnd", 19), int):
+        raise TypeError("Business hour summaries must contain integer hours")
+    if not isinstance(config.get("businessDays", []), list) or any(not isinstance(day, int) for day in config.get("businessDays", [])):
+        raise TypeError("Business day summaries must contain integer days")
+    grouped: dict[tuple[int, int], list[int]] = {}
+    for day in range(7):
+        found, window = get_exact_business_window(config, day)
+        if not found:
+            window = (int(config.get("businessStart", 7))*60, int(config.get("businessEnd", 19))*60) if day in config.get("businessDays", [0,1,2,3,4,5]) else None
+        if window:
+            grouped.setdefault(window, []).append(day)
+    return "; ".join(f"{format_days_label({'businessDays': days})}, {format_minutes_spoken(window[0])} to {format_minutes_spoken(window[1])}" for window, days in grouped.items()) or "Closed every day; hours need staff confirmation"
